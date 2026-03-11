@@ -1,25 +1,42 @@
 "use client";
 
 import { useEditorStore } from "@/stores/editor-store";
+import { VideoPlayer } from "@/components/VideoPlayer";
 import { useCallback, useRef, useState } from "react";
 
+const API = "http://localhost:8000";
+
 export default function EditorPage() {
-  const { project, setProject, setStatus } = useEditorStore();
+  const {
+    project,
+    currentTime,
+    isPlaying,
+    setProject,
+    setStatus,
+    setCurrentTime,
+    setIsPlaying,
+    updateSegmentText,
+    setCaptionStyle,
+  } = useEditorStore();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
+  const [progress, setProgress] = useState("");
+  const [rendering, setRendering] = useState(false);
+  const [renderUrl, setRenderUrl] = useState<string | null>(null);
 
   const handleUpload = useCallback(
     async (file: File) => {
       setUploading(true);
-      const formData = new FormData();
-      formData.append("file", file);
+      setProgress("Uploading video...");
 
       try {
-        const res = await fetch("/api/v1/process-video", {
+        // Step 1: Upload
+        const formData = new FormData();
+        formData.append("file", file);
+        const res = await fetch(`${API}/api/v1/process-video`, {
           method: "POST",
           body: formData,
         });
-
         if (!res.ok) throw new Error("Upload failed");
         const data = await res.json();
 
@@ -43,9 +60,10 @@ export default function EditorPage() {
           status: "transcribing",
         });
 
-        // Kick off transcription
+        // Step 2: Transcribe
+        setProgress("Transcribing audio (this may take a moment)...");
         const txRes = await fetch(
-          `/api/v1/transcribe/${data.project_id}`,
+          `${API}/api/v1/transcribe/${data.project_id}?model_size=base`,
           { method: "POST" }
         );
         if (!txRes.ok) throw new Error("Transcription failed");
@@ -70,8 +88,10 @@ export default function EditorPage() {
           },
           status: "editing",
         });
+        setProgress("");
       } catch (err) {
         setStatus("error", (err as Error).message);
+        setProgress("");
       } finally {
         setUploading(false);
       }
@@ -79,6 +99,31 @@ export default function EditorPage() {
     [setProject, setStatus]
   );
 
+  const handleRender = useCallback(async () => {
+    if (!project) return;
+    setRendering(true);
+    setProgress("Rendering final video with captions...");
+    try {
+      const res = await fetch(`${API}/api/v1/render/${project.id}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          segments: project.transcript,
+          caption_style: project.captionStyle,
+        }),
+      });
+      if (!res.ok) throw new Error("Render failed");
+      const data = await res.json();
+      setRenderUrl(`${API}${data.download_url}`);
+      setProgress("");
+    } catch (err) {
+      setProgress(`Render error: ${(err as Error).message}`);
+    } finally {
+      setRendering(false);
+    }
+  }, [project]);
+
+  // --- Upload Screen ---
   if (!project) {
     return (
       <main className="flex min-h-screen flex-col items-center justify-center p-8">
@@ -109,6 +154,12 @@ export default function EditorPage() {
             {uploading ? "Processing..." : "Upload Video"}
           </button>
 
+          {progress && (
+            <p className="mt-4 text-sm text-orange-400 animate-pulse">
+              {progress}
+            </p>
+          )}
+
           <p className="mt-4 text-sm text-neutral-500">
             Supports MP4, MOV, WebM up to 2GB
           </p>
@@ -117,36 +168,80 @@ export default function EditorPage() {
     );
   }
 
+  // --- Editor Screen ---
+  const videoUrl = `${API}/api/v1/video/${project.id}`;
+
   return (
-    <main className="flex h-screen">
+    <main className="flex h-screen overflow-hidden">
       {/* Left Panel: Transcript Editor */}
-      <div className="w-1/3 border-r border-neutral-800 overflow-y-auto p-4">
-        <h2 className="mb-4 text-lg font-semibold">Transcript</h2>
-        {project.status === "transcribing" && (
-          <p className="text-neutral-400 animate-pulse">Transcribing...</p>
-        )}
-        {project.transcript.map((segment) => (
-          <TranscriptBlock key={segment.id} segment={segment} />
-        ))}
+      <div className="w-[320px] flex-shrink-0 border-r border-neutral-800 flex flex-col">
+        <div className="p-4 border-b border-neutral-800">
+          <h2 className="text-lg font-semibold">Transcript</h2>
+          <p className="text-xs text-neutral-500 mt-1">
+            Edit text below — captions update in real-time
+          </p>
+        </div>
+        <div className="flex-1 overflow-y-auto p-4 space-y-2">
+          {project.status === "transcribing" && (
+            <p className="text-neutral-400 animate-pulse">{progress}</p>
+          )}
+          {project.transcript.map((segment) => (
+            <TranscriptBlock
+              key={segment.id}
+              segment={segment}
+              isActive={
+                currentTime >= segment.start && currentTime <= segment.end
+              }
+            />
+          ))}
+        </div>
       </div>
 
       {/* Center: Video Preview */}
-      <div className="flex-1 flex flex-col items-center justify-center bg-neutral-900 p-4">
-        <div className="aspect-[9/16] max-h-[80vh] w-auto bg-black rounded-lg flex items-center justify-center">
-          <p className="text-neutral-500">Video Preview (Remotion)</p>
-        </div>
-        <div className="mt-4 flex gap-2">
-          <button className="rounded bg-neutral-800 px-4 py-2 text-sm hover:bg-neutral-700">
-            Play
+      <div className="flex-1 flex flex-col items-center justify-center bg-neutral-900 p-4 min-w-0">
+        {progress && (
+          <p className="mb-4 text-sm text-orange-400 animate-pulse">
+            {progress}
+          </p>
+        )}
+
+        <VideoPlayer
+          videoUrl={videoUrl}
+          segments={project.transcript}
+          captionStyle={project.captionStyle}
+          durationInSeconds={project.duration}
+          width={project.width}
+          height={project.height}
+          currentTime={currentTime}
+          isPlaying={isPlaying}
+          onTimeUpdate={setCurrentTime}
+          onPlayPause={setIsPlaying}
+        />
+
+        {/* Export button */}
+        <div className="mt-4 flex gap-3 items-center">
+          <button
+            onClick={handleRender}
+            disabled={rendering}
+            className="rounded-lg bg-green-600 px-6 py-2 text-sm font-semibold text-white hover:bg-green-700 transition-colors disabled:opacity-50"
+          >
+            {rendering ? "Rendering..." : "Export Video"}
           </button>
-          <span className="px-4 py-2 text-sm text-neutral-400">
-            {formatTime(0)} / {formatTime(project.duration)}
-          </span>
+
+          {renderUrl && (
+            <a
+              href={renderUrl}
+              download
+              className="rounded-lg border border-green-600 px-6 py-2 text-sm font-semibold text-green-400 hover:bg-green-900/30 transition-colors"
+            >
+              Download
+            </a>
+          )}
         </div>
       </div>
 
       {/* Right Panel: Style Controls */}
-      <div className="w-1/4 border-l border-neutral-800 overflow-y-auto p-4">
+      <div className="w-[280px] flex-shrink-0 border-l border-neutral-800 overflow-y-auto p-4">
         <h2 className="mb-4 text-lg font-semibold">Caption Style</h2>
         <StylePanel />
       </div>
@@ -156,18 +251,26 @@ export default function EditorPage() {
 
 function TranscriptBlock({
   segment,
+  isActive,
 }: {
   segment: { id: string; text: string; start: number; end: number };
+  isActive: boolean;
 }) {
   const { updateSegmentText } = useEditorStore();
 
   return (
-    <div className="mb-3 rounded-lg border border-neutral-800 p-3 hover:border-neutral-600 transition-colors">
-      <span className="text-xs text-neutral-500">
+    <div
+      className={`rounded-lg border p-3 transition-colors ${
+        isActive
+          ? "border-orange-500 bg-orange-500/10"
+          : "border-neutral-800 hover:border-neutral-600"
+      }`}
+    >
+      <span className="text-xs text-neutral-500 font-mono">
         {formatTime(segment.start)} - {formatTime(segment.end)}
       </span>
       <textarea
-        className="mt-1 w-full resize-none bg-transparent text-sm text-neutral-200 outline-none"
+        className="mt-1 w-full resize-none bg-transparent text-sm text-neutral-200 outline-none leading-relaxed"
         value={segment.text}
         rows={2}
         onChange={(e) => updateSegmentText(segment.id, e.target.value)}
@@ -189,10 +292,12 @@ function StylePanel() {
   ];
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-5">
       <div>
-        <label className="text-xs text-neutral-400">Template</label>
-        <div className="mt-1 grid grid-cols-2 gap-2">
+        <label className="text-xs text-neutral-400 uppercase tracking-wider">
+          Template
+        </label>
+        <div className="mt-2 grid grid-cols-2 gap-2">
           {templates.map((t) => (
             <button
               key={t.id}
@@ -210,9 +315,11 @@ function StylePanel() {
       </div>
 
       <div>
-        <label className="text-xs text-neutral-400">Font</label>
+        <label className="text-xs text-neutral-400 uppercase tracking-wider">
+          Font
+        </label>
         <select
-          className="mt-1 w-full rounded bg-neutral-800 px-3 py-2 text-sm text-neutral-200"
+          className="mt-2 w-full rounded bg-neutral-800 px-3 py-2 text-sm text-neutral-200"
           value={project.captionStyle.fontFamily}
           onChange={(e) => setCaptionStyle({ fontFamily: e.target.value })}
         >
@@ -225,10 +332,45 @@ function StylePanel() {
       </div>
 
       <div>
-        <label className="text-xs text-neutral-400">Highlight Color</label>
+        <label className="text-xs text-neutral-400 uppercase tracking-wider">
+          Font Size
+        </label>
+        <input
+          type="range"
+          min="24"
+          max="96"
+          value={project.captionStyle.fontSize}
+          onChange={(e) =>
+            setCaptionStyle({ fontSize: Number(e.target.value) })
+          }
+          className="mt-2 w-full"
+        />
+        <span className="text-xs text-neutral-500">
+          {project.captionStyle.fontSize}px
+        </span>
+      </div>
+
+      <div>
+        <label className="text-xs text-neutral-400 uppercase tracking-wider">
+          Text Color
+        </label>
         <input
           type="color"
-          className="mt-1 h-8 w-full cursor-pointer rounded"
+          className="mt-2 h-8 w-full cursor-pointer rounded border border-neutral-700"
+          value={project.captionStyle.primaryColor}
+          onChange={(e) =>
+            setCaptionStyle({ primaryColor: e.target.value })
+          }
+        />
+      </div>
+
+      <div>
+        <label className="text-xs text-neutral-400 uppercase tracking-wider">
+          Highlight Color
+        </label>
+        <input
+          type="color"
+          className="mt-2 h-8 w-full cursor-pointer rounded border border-neutral-700"
           value={project.captionStyle.highlightColor}
           onChange={(e) =>
             setCaptionStyle({ highlightColor: e.target.value })
@@ -237,13 +379,15 @@ function StylePanel() {
       </div>
 
       <div>
-        <label className="text-xs text-neutral-400">Position</label>
-        <div className="mt-1 flex gap-2">
+        <label className="text-xs text-neutral-400 uppercase tracking-wider">
+          Position
+        </label>
+        <div className="mt-2 flex gap-2">
           {(["top", "center", "bottom"] as const).map((pos) => (
             <button
               key={pos}
               onClick={() => setCaptionStyle({ position: pos })}
-              className={`flex-1 rounded px-3 py-2 text-xs capitalize ${
+              className={`flex-1 rounded px-3 py-2 text-xs capitalize transition-colors ${
                 project.captionStyle.position === pos
                   ? "bg-orange-500 text-white"
                   : "bg-neutral-800 text-neutral-300"
@@ -256,13 +400,19 @@ function StylePanel() {
       </div>
 
       <div>
-        <label className="text-xs text-neutral-400">Animation</label>
+        <label className="text-xs text-neutral-400 uppercase tracking-wider">
+          Animation
+        </label>
         <select
-          className="mt-1 w-full rounded bg-neutral-800 px-3 py-2 text-sm text-neutral-200"
+          className="mt-2 w-full rounded bg-neutral-800 px-3 py-2 text-sm text-neutral-200"
           value={project.captionStyle.animation}
           onChange={(e) =>
             setCaptionStyle({
-              animation: e.target.value as "pop" | "fade" | "typewriter" | "karaoke",
+              animation: e.target.value as
+                | "pop"
+                | "fade"
+                | "typewriter"
+                | "karaoke",
             })
           }
         >

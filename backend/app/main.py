@@ -6,6 +6,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel
 
 app = FastAPI(title="Bharat Shorts API", version="0.1.0")
@@ -211,29 +212,375 @@ async def api_remove_silence(project_id: str):
 
 
 @app.post("/api/v1/transcribe/{project_id}", response_model=TranscriptResponse)
-async def transcribe_video(project_id: str):
-    """Transcribe video audio. Currently returns a placeholder.
-    Will be replaced with Faster-Whisper / IndicWhisper in Phase 2.
+async def transcribe_video(project_id: str, language: str | None = None, model_size: str = "base"):
+    """Transcribe video audio using Faster-Whisper with word-level timestamps.
+
+    Args:
+        project_id: UUID of the uploaded video
+        language: Optional language code (e.g. 'hi', 'en', 'ta'). None = auto-detect.
+        model_size: Whisper model size ('tiny', 'base', 'small', 'medium', 'large-v3')
+    """
+    from services.transcription import transcribe
+
+    matches = list(UPLOAD_DIR.glob(f"{project_id}.*"))
+    if not matches:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    result = transcribe(str(matches[0]), model_size=model_size, language=language)
+
+    segments = [
+        TranscriptSegment(
+            id=seg["id"],
+            words=[TranscriptWord(**w) for w in seg["words"]],
+            text=seg["text"],
+            start=seg["start"],
+            end=seg["end"],
+            speaker=seg.get("speaker"),
+        )
+        for seg in result["segments"]
+    ]
+
+    return TranscriptResponse(
+        project_id=project_id,
+        segments=segments,
+        language=result["language"],
+    )
+
+
+@app.get("/api/v1/transcript/{project_id}/srt")
+async def get_srt(project_id: str, language: str | None = None, model_size: str = "base"):
+    """Get transcript as downloadable SRT file."""
+    from fastapi.responses import PlainTextResponse
+    from services.transcription import transcribe, generate_srt
+
+    matches = list(UPLOAD_DIR.glob(f"{project_id}.*"))
+    if not matches:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    result = transcribe(str(matches[0]), model_size=model_size, language=language)
+    srt_content = generate_srt(result["segments"])
+
+    return PlainTextResponse(
+        content=srt_content,
+        media_type="text/plain",
+        headers={"Content-Disposition": f"attachment; filename={project_id}.srt"},
+    )
+
+
+@app.get("/api/v1/video/{project_id}")
+async def serve_video(project_id: str):
+    """Serve uploaded video file for browser playback."""
+    matches = list(UPLOAD_DIR.glob(f"{project_id}.*"))
+    if not matches:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    file_path = matches[0]
+    media_types = {
+        ".mp4": "video/mp4",
+        ".webm": "video/webm",
+        ".mov": "video/quicktime",
+    }
+    media_type = media_types.get(file_path.suffix.lower(), "video/mp4")
+
+    return FileResponse(
+        path=str(file_path),
+        media_type=media_type,
+        headers={
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "no-cache",
+        },
+    )
+
+
+class RenderRequest(BaseModel):
+    segments: list[TranscriptSegment]
+    caption_style: dict
+
+
+class RenderResponse(BaseModel):
+    project_id: str
+    status: str
+    download_url: str
+    duration: float
+
+
+@app.post("/api/v1/render/{project_id}", response_model=RenderResponse)
+async def render_video(project_id: str, req: RenderRequest):
+    """Burn captions into video using FFmpeg ASS subtitles.
+
+    This is a server-side caption burn approach using FFmpeg's subtitle filter.
+    For MVP, this renders hardcoded captions onto the video.
     """
     matches = list(UPLOAD_DIR.glob(f"{project_id}.*"))
     if not matches:
         raise HTTPException(status_code=404, detail="Video not found")
 
-    # TODO: Replace with actual Whisper transcription in Phase 2
-    # For now, return a placeholder to unblock frontend development
-    return TranscriptResponse(
+    input_path = str(matches[0])
+    output_path = str(PROCESSED_DIR / f"{project_id}_captioned.mp4")
+
+    # Generate ASS subtitle file from segments
+    ass_path = str(PROCESSED_DIR / f"{project_id}.ass")
+    ass_content = _generate_ass(req.segments, req.caption_style)
+    with open(ass_path, "w", encoding="utf-8") as f:
+        f.write(ass_content)
+
+    # Burn subtitles into video
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-vf", f"ass={ass_path}",
+        "-c:v", "libx264", "-preset", "fast",
+        "-c:a", "aac",
+        output_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise HTTPException(status_code=500, detail=f"Render failed: {result.stderr[:500]}")
+
+    info = get_video_info(output_path)
+
+    return RenderResponse(
         project_id=project_id,
-        segments=[
-            TranscriptSegment(
-                id=str(uuid.uuid4()),
-                words=[
-                    TranscriptWord(text="Placeholder", start=0.0, end=0.5, confidence=1.0),
-                    TranscriptWord(text="transcript", start=0.5, end=1.0, confidence=1.0),
-                ],
-                text="Placeholder transcript - Whisper integration coming in Phase 2",
-                start=0.0,
-                end=2.0,
-            )
-        ],
-        language="hi",
+        status="complete",
+        download_url=f"/api/v1/download/{project_id}",
+        duration=float(info["format"]["duration"]),
+    )
+
+
+@app.get("/api/v1/download/{project_id}")
+async def download_rendered(project_id: str):
+    """Download the rendered video with burned-in captions."""
+    output_path = PROCESSED_DIR / f"{project_id}_captioned.mp4"
+    if not output_path.exists():
+        raise HTTPException(status_code=404, detail="Rendered video not found")
+
+    return FileResponse(
+        path=str(output_path),
+        media_type="video/mp4",
+        filename=f"bharat-shorts-{project_id[:8]}.mp4",
+    )
+
+
+def _generate_ass(segments: list[TranscriptSegment], style: dict) -> str:
+    """Generate ASS subtitle file from transcript segments."""
+    font = style.get("fontFamily", "Arial")
+    font_size = style.get("fontSize", 48)
+    primary = style.get("primaryColor", "#FFFFFF")
+    highlight = style.get("highlightColor", "#FF6B00")
+    position = style.get("position", "bottom")
+
+    # ASS uses BGR color format: &HBBGGRR&
+    primary_bgr = _hex_to_ass_color(primary)
+    highlight_bgr = _hex_to_ass_color(highlight)
+
+    # Alignment: 2=bottom-center, 5=middle-center, 8=top-center
+    alignment = {"bottom": 2, "center": 5, "top": 8}.get(position, 2)
+
+    # Margin from edge
+    margin_v = 60
+
+    header = f"""[Script Info]
+Title: Bharat Shorts Captions
+ScriptType: v4.00+
+PlayResX: 1920
+PlayResY: 1080
+WrapStyle: 0
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,{font},{font_size},{primary_bgr},&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,3,2,{alignment},40,40,{margin_v},1
+Style: Highlight,{font},{int(font_size * 1.1)},{highlight_bgr},&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,3,2,{alignment},40,40,{margin_v},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+
+    events = []
+    for seg in segments:
+        start = _seconds_to_ass_time(seg.start)
+        end = _seconds_to_ass_time(seg.end)
+
+        # Build karaoke-style text with word-level highlighting
+        if seg.words:
+            parts = []
+            for word in seg.words:
+                # Duration in centiseconds for karaoke effect
+                duration_cs = int((word.end - word.start) * 100)
+                parts.append(f"{{\\kf{duration_cs}}}{word.text}")
+            text = " ".join(parts) if not parts else "".join(
+                f"{{\\kf{int((w.end - w.start) * 100)}}}{w.text} " for w in seg.words
+            ).strip()
+        else:
+            text = seg.text
+
+        events.append(
+            f"Dialogue: 0,{start},{end},Default,,0,0,0,,{text}"
+        )
+
+    return header + "\n".join(events) + "\n"
+
+
+def _hex_to_ass_color(hex_color: str) -> str:
+    """Convert #RRGGBB to ASS &H00BBGGRR& format."""
+    hex_color = hex_color.lstrip("#")
+    r = int(hex_color[0:2], 16)
+    g = int(hex_color[2:4], 16)
+    b = int(hex_color[4:6], 16)
+    return f"&H00{b:02X}{g:02X}{r:02X}&"
+
+
+def _seconds_to_ass_time(seconds: float) -> str:
+    """Convert seconds to ASS time format H:MM:SS.cc"""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    cs = int((seconds % 1) * 100)
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+
+# --- Magic Clips ---
+
+class ClipSuggestion(BaseModel):
+    title: str
+    start_time: float
+    end_time: float
+    duration: float
+    score: float
+    reason: str
+
+
+class MagicClipsResponse(BaseModel):
+    project_id: str
+    clips: list[ClipSuggestion]
+
+
+@app.post("/api/v1/magic-clips/{project_id}", response_model=MagicClipsResponse)
+async def magic_clips(project_id: str, model_size: str = "base"):
+    """Analyze video transcript and suggest viral-worthy short clips."""
+    from services.transcription import transcribe
+    from services.magic_clips import find_highlights
+
+    matches = list(UPLOAD_DIR.glob(f"{project_id}.*"))
+    if not matches:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    result = transcribe(str(matches[0]), model_size=model_size)
+    clips = find_highlights(result["segments"])
+
+    return MagicClipsResponse(
+        project_id=project_id,
+        clips=[ClipSuggestion(**c) for c in clips],
+    )
+
+
+# --- Auto Reframe ---
+
+class ReframeRequest(BaseModel):
+    target_width: int = 1080
+    target_height: int = 1920
+
+
+class ReframeResponse(BaseModel):
+    project_id: str
+    output_path: str
+    width: int
+    height: int
+
+
+@app.post("/api/v1/reframe/{project_id}", response_model=ReframeResponse)
+async def reframe_video(project_id: str, req: ReframeRequest):
+    """Convert landscape video to portrait (9:16) with center crop."""
+    from services.reframe import reframe_video as do_reframe
+
+    matches = list(UPLOAD_DIR.glob(f"{project_id}.*"))
+    if not matches:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    output_path = str(PROCESSED_DIR / f"{project_id}_portrait.mp4")
+    do_reframe(str(matches[0]), output_path, req.target_width, req.target_height)
+
+    return ReframeResponse(
+        project_id=project_id,
+        output_path=output_path,
+        width=req.target_width,
+        height=req.target_height,
+    )
+
+
+# --- B-Roll Suggestions ---
+
+class BRollMatch(BaseModel):
+    keyword: str
+    start_time: float
+    end_time: float
+    videos: list[dict]
+
+
+class BRollResponse(BaseModel):
+    project_id: str
+    suggestions: list[BRollMatch]
+
+
+@app.post("/api/v1/broll-suggestions/{project_id}", response_model=BRollResponse)
+async def broll_suggestions(project_id: str, model_size: str = "base"):
+    """Get B-roll suggestions for each transcript segment."""
+    from services.transcription import transcribe
+    from services.broll import match_broll_to_segments
+
+    matches = list(UPLOAD_DIR.glob(f"{project_id}.*"))
+    if not matches:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    result = transcribe(str(matches[0]), model_size=model_size)
+    suggestions = match_broll_to_segments(result["segments"])
+
+    return BRollResponse(
+        project_id=project_id,
+        suggestions=[BRollMatch(**s) for s in suggestions],
+    )
+
+
+# --- Enterprise Bulk API ---
+
+class BulkProcessRequest(BaseModel):
+    project_ids: list[str]
+    options: dict = {
+        "remove_silence": True,
+        "model_size": "base",
+        "language": None,
+    }
+
+
+class BulkProcessResponse(BaseModel):
+    task_ids: dict[str, str]
+    status: str
+
+
+@app.post("/api/v1/automate", response_model=BulkProcessResponse)
+async def bulk_process(req: BulkProcessRequest):
+    """Enterprise bulk processing endpoint.
+
+    Queues multiple videos for async processing via Celery.
+    Returns task IDs for tracking progress.
+
+    Note: Requires Redis + Celery worker running.
+    """
+    task_ids = {}
+
+    for project_id in req.project_ids:
+        matches = list(UPLOAD_DIR.glob(f"{project_id}.*"))
+        if not matches:
+            task_ids[project_id] = "error:not_found"
+            continue
+
+        try:
+            from workers.tasks import process_video_full
+            task = process_video_full.delay(project_id, req.options)
+            task_ids[project_id] = task.id
+        except Exception:
+            # Celery not available — process synchronously
+            task_ids[project_id] = f"sync:{project_id}"
+
+    return BulkProcessResponse(
+        task_ids=task_ids,
+        status="queued",
     )
