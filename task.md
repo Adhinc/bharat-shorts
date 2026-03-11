@@ -1,12 +1,33 @@
-# Tasks: Indian-Localized AI Video Automation Platform
+# Bharat-Shorts Implementation Roadmap
 
-- [x] Research and Document Phase <!-- id: 0 -->
-    - [x] Analyze Submagic core technical capabilities <!-- id: 1 -->
-    - [x] Identify Indian market localization requirements (languages, platforms, infrastructure) <!-- id: 2 -->
-    - [x] Draft Master Architecture & Implementation Document for Claude <!-- id: 3 -->
-- [x] Review and Handoff <!-- id: 4 -->
-    - [x] Finalize artifacts for user review <!-- id: 5 -->
-    - [x] Notify user with the comprehensive package <!-- id: 6 -->
-- [x] Git Repository Setup <!-- id: 7 -->
-    - [x] Create repository on GitHub <!-- id: 8 -->
-    - [x] Initialize local repository and push <!-- id: 9 -->
+We've discovered that the core foundation (transcription, basic editing, backend API) is already built. Below are the advanced features remaining to make this a true Submagic competitor.
+
+## Phase 1: AI Precision (Current Focus)
+- [/] **Smart Face-Centric Reframe** <!-- id: 10 -->
+    - [/] Integrate MediaPipe face detection in `backend/services/reframe.py`
+    - [ ] Implement dynamic cropping that follows the speaker
+- [ ] **AI Eye Contact Correction** <!-- id: 11 -->
+    - [ ] Research/Integrate GAN-based model for focal point correction
+- [ ] **Advanced Transcription** <!-- id: 12 -->
+    - [ ] Fine-tune IndicWhisper for better regional dialect handling
+
+## Phase 2: High-End Aesthetics
+- [ ] **Remotion Export Engine** <!-- id: 13 -->
+    - [ ] Replace FFmpeg-ASS rendering with Remotion-based high-fidelity rendering
+    - [ ] Support complex animations (pop, bounce, emoji-swaps)
+- [ ] **Automated SFX & Music** <!-- id: 14 -->
+    - [ ] Auto-generate transitions with "Whoosh" sounds
+    - [ ] Auto-duck music using the implemented ducking logic in `broll.py`
+- [ ] **AI Stock Integration** <!-- id: 15 -->
+    - [ ] Connect Pexels/Pixabay specifically for Indian landscape/city stock
+
+## Phase 3: Commercial & Scale
+- [/] **Payment Integration** <!-- id: 16 -->
+    - [ ] Razorpay hooks for subscription management
+- [ ] **Celery/Redis Scale** <!-- id: 17 -->
+    - [ ] Setup production workers for high-res 4K renders
+
+## Project Status
+- **Backend:** Functional MVP (FastAPI)
+- **Frontend:** Functional Editor (Next.js + Remotion Player)
+- **Git:** Synced

@@ -6,3 +6,5 @@ redis==7.3.0
 python-dotenv==1.2.2
 pydantic==2.12.5
 faster-whisper==1.2.1
+mediapipe==0.10.20
+opencv-python==4.11.0.86

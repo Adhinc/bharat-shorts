@@ -57,31 +57,56 @@ def _get_video_duration(input_path: str) -> float:
     return float(duration)
 
 
-def detect_face_position(frame_path: str) -> tuple[int, int]:
+def detect_face_position(input_path: str, sample_frames: int = 5) -> tuple[int, int]:
     """
-    Detect the primary face position in a video frame.
+    Detect the primary face position in a video by averaging the first N frames.
 
     Returns:
         (x, y) pixel coordinates of the face center.
-
-    Currently returns the center of the frame as a placeholder.
-
-    TODO: Integrate MediaPipe Face Detection for accurate face tracking.
-    MediaPipe's mp.solutions.face_detection can return bounding boxes
-    per frame, which we can use to dynamically shift the crop window
-    so the speaker stays centered in the portrait output.
     """
-    from PIL import Image
+    import cv2
+    import mediapipe as mp
+    import numpy as np
 
-    try:
-        img = Image.open(frame_path)
-        w, h = img.size
-        return (w // 2, h // 2)
-    except Exception:
-        # If we can't open the frame, fall back to a generic center
-        # assuming 1920x1080 landscape input
-        logger.warning("Could not open frame %s, using default center", frame_path)
-        return (960, 540)
+    mp_face_detection = mp.solutions.face_detection
+    
+    src_w, src_h = _get_video_dimensions(input_path)
+    cap = cv2.VideoCapture(input_path)
+    
+    face_centers = []
+    
+    with mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5) as face_detection:
+        for _ in range(sample_frames):
+            success, image = cap.read()
+            if not success:
+                break
+            
+            # Convert to RGB for MediaPipe
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            results = face_detection.process(image_rgb)
+            
+            if results.detections:
+                # Get the first (primary) detection
+                detection = results.detections[0]
+                bbox = detection.location_data.relative_bounding_box
+                
+                # Convert relative coordinates to pixel coordinates
+                center_x = int((bbox.xmin + bbox.width / 2) * src_w)
+                center_y = int((bbox.ymin + bbox.height / 2) * src_h)
+                face_centers.append((center_x, center_y))
+    
+    cap.release()
+    
+    if face_centers:
+        # Return the median center to avoid outliers
+        avg_x = int(np.median([c[0] for c in face_centers]))
+        avg_y = int(np.median([c[1] for c in face_centers]))
+        logger.info(f"Detected face at ({avg_x}, {avg_y})")
+        return (avg_x, avg_y)
+    
+    # Fallback to center if no face detected
+    logger.warning("No face detected, falling back to center crop")
+    return (src_w // 2, src_h // 2)
 
 
 def reframe_video(
@@ -91,23 +116,10 @@ def reframe_video(
     target_height: int = 1920,
 ) -> str:
     """
-    Convert a landscape (16:9) video to portrait (9:16) via center-crop.
+    Convert a landscape (16:9) video to portrait (9:16) via AI-powered face-centric crop.
 
-    The source video is cropped to a 9:16 region taken from the horizontal
-    center, then scaled to the exact target dimensions.
-
-    Args:
-        input_path:    Path to the source landscape video.
-        output_path:   Where to write the portrait result.
-        target_width:  Output width in pixels  (default 1080).
-        target_height: Output height in pixels (default 1920).
-
-    Returns:
-        The output_path on success.
-
-    Raises:
-        FileNotFoundError: If input_path does not exist.
-        RuntimeError:      If FFmpeg/FFprobe fails.
+    The source video is cropped to a 9:16 region centered on the detected face,
+    then scaled to the exact target dimensions.
     """
     if not Path(input_path).is_file():
         raise FileNotFoundError(f"Input video not found: {input_path}")
@@ -117,30 +129,35 @@ def reframe_video(
     src_w, src_h = _get_video_dimensions(input_path)
     logger.info("Source dimensions: %dx%d", src_w, src_h)
 
+    # Detect face position
+    face_x, face_y = detect_face_position(input_path)
+
     # Calculate the largest 9:16 crop that fits inside the source frame.
-    # Try height-constrained first (use full height, compute width).
     crop_h = src_h
     crop_w = int(crop_h * target_width / target_height)
 
     if crop_w > src_w:
-        # Width-constrained instead (use full width, compute height).
         crop_w = src_w
         crop_h = int(crop_w * target_height / target_width)
 
-    # Ensure even dimensions (required by most codecs)
+    # Ensure even dimensions
     crop_w = crop_w - (crop_w % 2)
     crop_h = crop_h - (crop_h % 2)
 
-    # Center the crop window
-    x_offset = (src_w - crop_w) // 2
-    y_offset = (src_h - crop_h) // 2
+    # Center the crop window around the face_x, but clamp to frame boundaries
+    x_offset = int(face_x - crop_w // 2)
+    y_offset = int(face_y - crop_h // 2)
+
+    # Clamp offsets so we don't crop outside the frame
+    x_offset = max(0, min(x_offset, src_w - crop_w))
+    y_offset = max(0, min(y_offset, src_h - crop_h))
 
     logger.info(
-        "Crop region: %dx%d at offset (%d, %d) -> scale to %dx%d",
+        "Face-centric crop: %dx%d at offset (%d, %d) -> scale to %dx%d",
         crop_w, crop_h, x_offset, y_offset, target_width, target_height,
     )
 
-    # Build the FFmpeg filter: crop then scale to exact target size
+    # Build the FFmpeg filter
     vf = (
         f"crop={crop_w}:{crop_h}:{x_offset}:{y_offset},"
         f"scale={target_width}:{target_height}:flags=lanczos"
