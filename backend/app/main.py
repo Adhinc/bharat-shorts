@@ -2,7 +2,12 @@ import os
 import uuid
 import subprocess
 import json
+import logging
 from pathlib import Path
+
+# Configure Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,13 +16,42 @@ from pydantic import BaseModel
 
 app = FastAPI(title="Bharat Shorts API", version="0.1.0")
 
+# --- Environment Setup (Handle Missing FFmpeg/FFprobe) ---
+def _setup_ffmpeg_path():
+    """Ensure ffmpeg/ffprobe from Remotion node_modules are in PATH if missing."""
+    import shutil
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        # Look for Remotion's bundled binaries
+        base_dir = Path(__file__).resolve().parent.parent.parent
+        remotion_bin_dir = base_dir / "frontend" / "node_modules" / "@remotion" / "compositor-win32-x64-msvc"
+        if remotion_bin_dir.exists():
+            os.environ["PATH"] = str(remotion_bin_dir) + os.pathsep + os.environ["PATH"]
+            logger.info(f"Added local FFmpeg to PATH: {remotion_bin_dir}")
+        else:
+            logger.error(f"Could NOT find Remotion FFmpeg at: {remotion_bin_dir}")
+
+_setup_ffmpeg_path()
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+from fastapi import Request
+from fastapi.responses import JSONResponse
+import traceback
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Global error handler caught: {exc}")
+    logger.error(traceback.format_exc())
+    return JSONResponse(
+        status_code=500,
+        content={"message": "Internal Server Error", "detail": str(exc), "traceback": traceback.format_exc()},
+    )
 
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -103,7 +137,8 @@ def remove_silence(input_path: str, output_path: str, threshold_db: float = -30,
 
     if not silence_starts:
         # No silence found, copy as-is
-        subprocess.run(["cp", input_path, output_path])
+        import shutil
+        shutil.copy(input_path, output_path)
         info = get_video_info(output_path)
         return float(info["format"]["duration"])
 
@@ -122,7 +157,8 @@ def remove_silence(input_path: str, output_path: str, threshold_db: float = -30,
         segments.append((prev_end, total_duration))
 
     if not segments:
-        subprocess.run(["cp", input_path, output_path])
+        import shutil
+        shutil.copy(input_path, output_path)
         return total_duration
 
     # Build FFmpeg filter for concatenating non-silent parts

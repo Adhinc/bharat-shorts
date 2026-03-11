@@ -16,7 +16,14 @@ export const VideoComposition: React.FC<Props> = ({
 }) => {
   return (
     <AbsoluteFill style={{ backgroundColor: "black" }}>
-      <OffthreadVideo src={videoUrl} />
+      <OffthreadVideo 
+        src={videoUrl} 
+        style={{
+          width: "100%",
+          height: "100%",
+          objectFit: "contain"
+        }}
+      />
       <CaptionRenderer segments={segments} style={captionStyle} />
     </AbsoluteFill>
   );
