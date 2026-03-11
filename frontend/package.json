@@ -6,20 +6,27 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "render-server": "npx tsx render-server.ts",
+    "remotion:studio": "npx remotion studio src/remotion/index.ts"
   },
   "dependencies": {
+    "@remotion/bundler": "^4.0.434",
     "@remotion/cli": "^4.0.434",
     "@remotion/player": "^4.0.434",
+    "@remotion/renderer": "^4.0.434",
     "@tailwindcss/postcss": "^4.2.1",
+    "@types/express": "^5.0.6",
     "@types/node": "^25.4.0",
     "@types/react": "^19.2.14",
+    "express": "^5.2.1",
     "next": "^16.1.6",
     "postcss": "^8.5.8",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
     "remotion": "^4.0.434",
     "tailwindcss": "^4.2.1",
+    "tsx": "^4.21.0",
     "typescript": "^5.9.3",
     "zustand": "^5.0.11"
   }

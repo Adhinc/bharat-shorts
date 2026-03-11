@@ -192,6 +192,213 @@ def reframe_video(
     return output_path
 
 
+def reframe_video_dynamic(
+    input_path: str,
+    output_path: str,
+    target_width: int = 1080,
+    target_height: int = 1920,
+    smoothing: float = 0.85,
+    sample_interval: int = 3,
+) -> dict:
+    """
+    Dynamic face-tracking reframe: follows the speaker frame-by-frame.
+
+    Pipeline:
+    1. Sample frames at intervals, detect face position per frame
+    2. Smooth positions with exponential moving average to avoid jitter
+    3. Interpolate positions for skipped frames
+    4. Render using OpenCV: per-frame crop centered on smoothed face position
+    5. Merge with original audio via FFmpeg
+
+    Args:
+        input_path: Source video path
+        output_path: Output path
+        target_width, target_height: Output dimensions (default 9:16)
+        smoothing: EMA smoothing factor (0.0=no smoothing, 0.99=very smooth)
+        sample_interval: Detect face every N frames (1=every frame, 3=every 3rd)
+
+    Returns:
+        {"output_path", "frames_processed", "faces_detected", "duration"}
+    """
+    import cv2
+    import numpy as np
+    import mediapipe as mp
+
+    if not Path(input_path).is_file():
+        raise FileNotFoundError(f"Input video not found: {input_path}")
+
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+
+    cap = cv2.VideoCapture(input_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video: {input_path}")
+
+    src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    # Calculate crop dimensions (9:16 region from source)
+    crop_h = src_h
+    crop_w = int(crop_h * target_width / target_height)
+    if crop_w > src_w:
+        crop_w = src_w
+        crop_h = int(crop_w * target_height / target_width)
+    crop_w = crop_w - (crop_w % 2)
+    crop_h = crop_h - (crop_h % 2)
+
+    # --- Pass 1: Detect face positions ---
+    logger.info(f"Dynamic reframe pass 1: detecting faces in {total_frames} frames...")
+
+    # Use FaceLandmarker (tasks API)
+    models_dir = Path(__file__).resolve().parent.parent / "models"
+    model_path = models_dir / "face_landmarker.task"
+
+    face_positions = {}  # frame_idx -> (cx, cy)
+
+    if model_path.exists():
+        base_options = mp.tasks.BaseOptions(model_asset_path=str(model_path))
+        options = mp.tasks.vision.FaceLandmarkerOptions(
+            base_options=base_options,
+            num_faces=1,
+        )
+        landmarker = mp.tasks.vision.FaceLandmarker.create_from_options(options)
+
+        frame_idx = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            if frame_idx % sample_interval == 0:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                result = landmarker.detect(mp_image)
+
+                if result.face_landmarks:
+                    landmarks = result.face_landmarks[0]
+                    # Use nose tip (landmark 1) as face center
+                    nose = landmarks[1]
+                    cx = int(nose.x * src_w)
+                    cy = int(nose.y * src_h)
+                    face_positions[frame_idx] = (cx, cy)
+
+            frame_idx += 1
+
+        landmarker.close()
+    else:
+        # Fallback: try mp.solutions
+        logger.warning("FaceLandmarker model not found, using center crop")
+
+    cap.release()
+
+    faces_detected = len(face_positions)
+    logger.info(f"Detected faces in {faces_detected}/{total_frames} frames")
+
+    # Default position: center
+    default_x, default_y = src_w // 2, src_h // 2
+
+    # --- Interpolate and smooth positions for all frames ---
+    all_positions = []
+    sorted_detected = sorted(face_positions.keys())
+
+    for i in range(total_frames):
+        if i in face_positions:
+            all_positions.append(face_positions[i])
+        elif sorted_detected:
+            # Interpolate between nearest detected frames
+            prev_idx = None
+            next_idx = None
+            for di in sorted_detected:
+                if di <= i:
+                    prev_idx = di
+                if di > i and next_idx is None:
+                    next_idx = di
+
+            if prev_idx is not None and next_idx is not None:
+                # Linear interpolation
+                t = (i - prev_idx) / (next_idx - prev_idx)
+                px, py = face_positions[prev_idx]
+                nx, ny = face_positions[next_idx]
+                all_positions.append((
+                    int(px + (nx - px) * t),
+                    int(py + (ny - py) * t),
+                ))
+            elif prev_idx is not None:
+                all_positions.append(face_positions[prev_idx])
+            elif next_idx is not None:
+                all_positions.append(face_positions[next_idx])
+            else:
+                all_positions.append((default_x, default_y))
+        else:
+            all_positions.append((default_x, default_y))
+
+    # Apply exponential moving average for smooth camera motion
+    smoothed = [all_positions[0]]
+    for i in range(1, len(all_positions)):
+        prev_x, prev_y = smoothed[-1]
+        curr_x, curr_y = all_positions[i]
+        sx = smoothing * prev_x + (1 - smoothing) * curr_x
+        sy = smoothing * prev_y + (1 - smoothing) * curr_y
+        smoothed.append((sx, sy))
+
+    # --- Pass 2: Render with dynamic crop ---
+    logger.info("Dynamic reframe pass 2: rendering...")
+
+    cap = cv2.VideoCapture(input_path)
+    temp_video = output_path + ".temp.mp4"
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(temp_video, fourcc, fps, (target_width, target_height))
+
+    for i in range(total_frames):
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        cx, cy = smoothed[i] if i < len(smoothed) else (default_x, default_y)
+
+        # Calculate crop offsets, clamped to frame bounds
+        x_off = int(cx - crop_w // 2)
+        y_off = int(cy - crop_h // 2)
+        x_off = max(0, min(x_off, src_w - crop_w))
+        y_off = max(0, min(y_off, src_h - crop_h))
+
+        # Crop and resize
+        cropped = frame[y_off:y_off + crop_h, x_off:x_off + crop_w]
+        resized = cv2.resize(cropped, (target_width, target_height), interpolation=cv2.INTER_LANCZOS4)
+        writer.write(resized)
+
+    cap.release()
+    writer.release()
+
+    # Merge with original audio
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", temp_video,
+        "-i", input_path,
+        "-map", "0:v",
+        "-map", "1:a?",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "192k",
+        "-shortest",
+        output_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    Path(temp_video).unlink(missing_ok=True)
+
+    if result.returncode != 0:
+        raise RuntimeError(f"FFmpeg merge failed: {result.stderr[:200]}")
+
+    duration = _get_video_duration(output_path)
+
+    return {
+        "output_path": output_path,
+        "frames_processed": total_frames,
+        "faces_detected": faces_detected,
+        "duration": duration,
+    }
+
+
 def auto_zoom(
     input_path: str,
     output_path: str,

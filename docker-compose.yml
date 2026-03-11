@@ -13,6 +13,7 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379/0
       - PEXELS_API_KEY=${PEXELS_API_KEY:-}
+      - PIXABAY_API_KEY=${PIXABAY_API_KEY:-}
     depends_on:
       - redis
     restart: unless-stopped
@@ -37,14 +38,92 @@ services:
       - redis_data:/data
     restart: unless-stopped
 
+  # Default worker — handles assembly, dubbing, full pipeline
   celery_worker:
     build:
       context: .
       dockerfile: Dockerfile.backend
-    command: celery -A workers.celery_app worker --loglevel=info
+    command: >
+      celery -A workers.celery_app worker
+      --loglevel=info
+      --queues=default,low
+      --concurrency=2
+      --hostname=worker-default@%h
     volumes:
       - uploads:/app/uploads
       - processed:/app/processed
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - PEXELS_API_KEY=${PEXELS_API_KEY:-}
+      - PIXABAY_API_KEY=${PIXABAY_API_KEY:-}
+      - CELERY_CONCURRENCY=2
+    depends_on:
+      - redis
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+
+  # GPU/heavy worker — handles transcription, rendering, eye contact, reframe
+  celery_worker_gpu:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    command: >
+      celery -A workers.celery_app worker
+      --loglevel=info
+      --queues=gpu,critical
+      --concurrency=1
+      --hostname=worker-gpu@%h
+      --max-tasks-per-child=10
+    volumes:
+      - uploads:/app/uploads
+      - processed:/app/processed
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_CONCURRENCY=1
+    depends_on:
+      - redis
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # Remotion render server (for high-quality exports)
+  render_server:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    command: npx tsx render-server.ts
+    ports:
+      - "3100:3100"
+    environment:
+      - RENDER_PORT=3100
+    volumes:
+      - processed:/app/backend/processed
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  # Flower — Celery monitoring dashboard
+  flower:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    command: >
+      celery -A workers.celery_app flower
+      --port=5555
+      --broker_api=redis://redis:6379/0
+      --basic_auth=${FLOWER_USER:-admin}:${FLOWER_PASSWORD:-bharatshorts}
+    ports:
+      - "5555:5555"
     environment:
       - REDIS_URL=redis://redis:6379/0
     depends_on:

@@ -3,29 +3,113 @@
 We've discovered that the core foundation (transcription, basic editing, backend API) is already built. Below are the advanced features remaining to make this a true Submagic competitor.
 
 ## Phase 1: AI Precision (Current Focus)
-- [/] **Smart Face-Centric Reframe** <!-- id: 10 -->
-    - [/] Integrate MediaPipe face detection in `backend/services/reframe.py`
-    - [ ] Implement dynamic cropping that follows the speaker
-- [ ] **AI Eye Contact Correction** <!-- id: 11 -->
-    - [ ] Research/Integrate GAN-based model for focal point correction
-- [ ] **Advanced Transcription** <!-- id: 12 -->
-    - [ ] Fine-tune IndicWhisper for better regional dialect handling
+- [x] **Smart Face-Centric Reframe** <!-- id: 10 -->
+    - [x] Integrate MediaPipe face detection in `backend/services/reframe.py`
+    - [x] Dynamic per-frame face tracking with EMA smoothing + interpolation
+    - [x] Two-pass pipeline: detect → smooth → render with OpenCV → FFmpeg merge
+    - [x] Frontend: "Dynamic Reframe" button + download
+- [x] **AI Eye Contact Correction** <!-- id: 11 -->
+    - [x] MediaPipe Face Mesh (478 landmarks) with iris tracking
+    - [x] Per-frame iris warp toward eye center using affine transform + Gaussian blending
+    - [x] Configurable correction strength and frame skip for speed
+    - [x] FFmpeg re-encoding with original audio merge
+    - [x] Frontend: "Eye Contact Fix" button + download
+- [x] **AI Actors Studio (Avatar Videos)** <!-- id: 21 -->
+    - [x] Text-to-video with AI avatars (5 presets + custom face upload)
+    - [x] Edge TTS voice synthesis in 24+ languages with male/female voices
+    - [x] Lip-sync mouth animation driven by audio energy (RMS)
+    - [x] 6 background templates (studio, gradient)
+    - [x] Word-by-word caption overlay with highlighted current word
+    - [x] Subtle breathing animation on avatars
+    - [x] Configurable speech rate (slow/normal/fast)
+    - [x] Frontend: Dedicated /avatar page with full controls
+    - [x] API: `/api/v1/avatar-video` and `/api/v1/avatar-video-with-image`
+- [x] **Content Ideation AI Tools** <!-- id: 22 -->
+    - [x] Video Idea Generator: listicle, story, tutorial, controversial, trending templates
+    - [x] Video Hook Generator: question, statistic, story, controversial styles
+    - [x] Video Script Generator: hook + body + CTA, 5 tones, duration targeting
+    - [x] English + Hinglish support for all generators
+    - [x] Frontend: Dedicated /tools page with 3 tabbed generators
+    - [x] API: `/api/v1/tools/ideas`, `/api/v1/tools/hooks`, `/api/v1/tools/script`
+- [x] **Platform-Specific Generators** <!-- id: 23 -->
+    - [x] YouTube Title Generator (15 patterns + Hinglish, SEO score)
+    - [x] YouTube Description Generator (timestamps, CTA, tags, resources)
+    - [x] Hashtag Generator (Instagram/TikTok/YouTube, 30 tags, broad/niche/specific breakdown)
+    - [x] Instagram Caption Generator (emojis, CTA, hashtags)
+    - [x] TikTok Caption Generator (short + punchy, under 150 chars)
+    - [x] LinkedIn Post Generator (professional tone)
+    - [x] Frontend: 3 new tabs on /tools page (YT Titles, Hashtags, Captions)
+    - [x] API: 6 endpoints under `/api/v1/tools/`
+- [x] **Advanced Transcription** <!-- id: 12 -->
+    - [x] Audio preprocessing (highpass, lowpass, loudnorm, noise gate) for noisy Indian recordings
+    - [x] Auto-model selection per language (base→small→medium based on script complexity)
+    - [x] Hinglish code-switching detection
+    - [x] Optimized beam search + temperature fallback per Indian language
+    - [x] Multi-model fallback (retries larger model if confidence < 0.6)
+    - [x] Regional dialect post-processing corrections (Hindi, Tamil, Marathi)
+    - [x] Lower VAD threshold (0.35) for soft-spoken speakers
+    - [x] WebVTT export endpoint (`/api/v1/transcript/{id}/vtt`)
+    - [x] Enhanced API response with language_probability, is_hinglish, model_used fields
+- [x] **AI Video Translator & Dubbing** <!-- id: 18 -->
+    - [x] Text translation across 24+ languages (Google Translate via deep-translator)
+    - [x] AI voice dubbing with Edge TTS (Hindi, Tamil, Marathi, Telugu, Bengali, etc.)
+    - [x] FFmpeg audio replacement/mixing pipeline
+    - [x] Frontend UI: language selector, translate captions, generate AI dub
+- [x] **URL Ingestion (YouTube, Podcast, Direct)** <!-- id: 19 -->
+    - [x] yt-dlp integration for YouTube videos, Shorts, podcasts, direct URLs
+    - [x] Auto-download up to 1080p, max 2GB
+    - [x] Podcast audio auto-converted to video for editor
+    - [x] Frontend: URL input with "Import" button on upload screen
+- [x] **Automated Assembly (B-Roll + Transitions + Music)** <!-- id: 20 -->
+    - [x] Auto-download matching B-Roll clips from Pexels stock footage
+    - [x] Insert B-Roll overlays at keyword-matched timestamps with crossfade
+    - [x] Background music mixing with speech-aware ducking
+    - [x] Music looping for longer videos
+    - [x] Full pipeline: `/api/v1/assemble/{project_id}`
+    - [x] Frontend: "Auto Assemble" button + download link
 
 ## Phase 2: High-End Aesthetics
-- [ ] **Remotion Export Engine** <!-- id: 13 -->
-    - [ ] Replace FFmpeg-ASS rendering with Remotion-based high-fidelity rendering
-    - [ ] Support complex animations (pop, bounce, emoji-swaps)
-- [ ] **Automated SFX & Music** <!-- id: 14 -->
-    - [ ] Auto-generate transitions with "Whoosh" sounds
-    - [ ] Auto-duck music using the implemented ducking logic in `broll.py`
-- [ ] **AI Stock Integration** <!-- id: 15 -->
-    - [ ] Connect Pexels/Pixabay specifically for Indian landscape/city stock
+- [x] **Remotion Export Engine** <!-- id: 13 -->
+    - [x] Remotion entry point (`src/remotion/Root.tsx`, `src/remotion/index.ts`) with registerRoot
+    - [x] Node.js render server (`render-server.ts`) using `@remotion/renderer` + `@remotion/bundler`
+    - [x] Backend service (`services/remotion_render.py`) calls Node render server
+    - [x] Auto-fallback: Remotion → FFmpeg-ASS if render server is down
+    - [x] 4 new animations: bounce (spring overshoot), glow (pulsing neon), shake (rapid hit), emoji-pop (keyword→emoji overlay)
+    - [x] 36 keyword→emoji mappings (fire, money, subscribe, India, etc.)
+    - [x] Frontend: "Export HD" (Remotion) + "Quick Export" (FFmpeg) buttons
+    - [x] Animation dropdown updated with all 8 animation types
+    - [x] Remotion Studio script: `npm run remotion:studio`
+- [x] **Automated SFX & Music** <!-- id: 14 -->
+    - [x] 8 synthesized SFX types via FFmpeg lavfi (whoosh, swoosh, pop, ding, bass_drop, rise, click, reveal)
+    - [x] Auto-place SFX at segment transitions, all segments, or long pauses
+    - [x] SFX mixing into video with adelay positioning + amix
+    - [x] 5 ambient music presets synthesized via FFmpeg (chill_lo_fi, upbeat_energy, cinematic_pad, news_intro, bollywood_vibe)
+    - [x] Music presets integrated into assembly pipeline (no external URLs needed)
+    - [x] Assembly pipeline now auto-adds whoosh SFX at transitions by default
+    - [x] API: `/api/v1/sfx-catalog`, `/api/v1/music-presets`, `/api/v1/sfx/{id}`, `/api/v1/generate-music/{preset}`
+    - [x] Frontend: "Add SFX" button (pink) + download link
+- [x] **AI Stock Integration** <!-- id: 15 -->
+    - [x] Dual-provider search: Pexels + Pixabay with fallback
+    - [x] 70 India-specific keyword mappings (food→Indian thali, city→Mumbai skyline, etc.)
+    - [x] 12 curated Indian categories (Mumbai, Delhi, Bangalore, Jaipur, Varanasi, Kerala, Street Food, Festivals, Nature, Daily Life, Business, Spirituality)
+    - [x] Auto keyword enhancement: generic queries get India context
+    - [x] India-enhanced B-Roll matching for transcript segments
+    - [x] API: `/api/v1/stock/search`, `/api/v1/stock/categories`, `/api/v1/stock/browse/{cat}`, `/api/v1/stock/match/{id}`
 
 ## Phase 3: Commercial & Scale
 - [/] **Payment Integration** <!-- id: 16 -->
     - [ ] Razorpay hooks for subscription management
-- [ ] **Celery/Redis Scale** <!-- id: 17 -->
-    - [ ] Setup production workers for high-res 4K renders
+- [x] **Celery/Redis Scale** <!-- id: 17 -->
+    - [x] 10 individual Celery tasks (transcribe, render, render_4k, assemble, eye_contact, reframe, avatar, dub, sfx, full_pipeline)
+    - [x] 4 priority queues: critical, gpu, default, low with task routing
+    - [x] Separate GPU worker (concurrency=1, 8GB) and default worker (concurrency=2, 4GB)
+    - [x] Task status polling: `GET /api/v1/task/{task_id}` with progress tracking
+    - [x] Generic async dispatch: `POST /api/v1/async/dispatch`
+    - [x] Queue stats: `GET /api/v1/queue/stats`
+    - [x] Flower monitoring dashboard on port 5555
+    - [x] Remotion render server in Docker
+    - [x] Rate limiting (transcribe: 10/m, 4K render: 2/m, avatar: 5/m)
+    - [x] Worker crash recovery (task_acks_late, reject_on_worker_lost)
 
 ## Project Status
 - **Backend:** Functional MVP (FastAPI)

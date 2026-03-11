@@ -91,6 +91,10 @@ class TranscriptResponse(BaseModel):
     project_id: str
     segments: list[TranscriptSegment]
     language: str
+    language_probability: float = 0.0
+    is_hinglish: bool = False
+    model_used: str = "base"
+    preprocessed: bool = False
 
 
 class SilenceRemovalResult(BaseModel):
@@ -281,6 +285,10 @@ async def transcribe_video(project_id: str, language: str | None = None, model_s
         project_id=project_id,
         segments=segments,
         language=result["language"],
+        language_probability=result.get("language_probability", 0.0),
+        is_hinglish=result.get("is_hinglish", False),
+        model_used=result.get("model_used", model_size),
+        preprocessed=result.get("preprocessed", False),
     )
 
 
@@ -301,6 +309,25 @@ async def get_srt(project_id: str, language: str | None = None, model_size: str 
         content=srt_content,
         media_type="text/plain",
         headers={"Content-Disposition": f"attachment; filename={project_id}.srt"},
+    )
+
+
+@app.get("/api/v1/transcript/{project_id}/vtt")
+async def get_vtt(project_id: str, language: str | None = None, model_size: str = "base"):
+    """Get transcript as downloadable WebVTT file."""
+    from services.transcription import transcribe, generate_vtt
+
+    matches = list(UPLOAD_DIR.glob(f"{project_id}.*"))
+    if not matches:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    result = transcribe(str(matches[0]), model_size=model_size, language=language)
+    vtt_content = generate_vtt(result["segments"])
+
+    return PlainTextResponse(
+        content=vtt_content,
+        media_type="text/vtt",
+        headers={"Content-Disposition": f"attachment; filename={project_id}.vtt"},
     )
 
 
@@ -332,6 +359,8 @@ async def serve_video(project_id: str):
 class RenderRequest(BaseModel):
     segments: list[TranscriptSegment]
     caption_style: dict
+    renderer: str = "auto"  # "auto", "remotion", "ffmpeg"
+    quality: str = "high"   # "fast" (FFmpeg), "high" (Remotion)
 
 
 class RenderResponse(BaseModel):
@@ -339,30 +368,81 @@ class RenderResponse(BaseModel):
     status: str
     download_url: str
     duration: float
+    renderer: str = "ffmpeg"  # Which renderer was used
 
 
 @app.post("/api/v1/render/{project_id}", response_model=RenderResponse)
 async def render_video(project_id: str, req: RenderRequest):
-    """Burn captions into video using FFmpeg ASS subtitles.
+    """Render video with captions using Remotion (high-quality) or FFmpeg-ASS (fast).
 
-    This is a server-side caption burn approach using FFmpeg's subtitle filter.
-    For MVP, this renders hardcoded captions onto the video.
+    Renderer selection:
+    - "auto" (default): Tries Remotion first, falls back to FFmpeg-ASS
+    - "remotion": Forces Remotion rendering (fails if server is down)
+    - "ffmpeg": Forces FFmpeg-ASS rendering (fast but limited animations)
     """
     matches = list(UPLOAD_DIR.glob(f"{project_id}.*"))
     if not matches:
         raise HTTPException(status_code=404, detail="Video not found")
 
     input_path = str(matches[0])
-    output_path = str(PROCESSED_DIR / f"{project_id}_captioned.mp4")
+    info = get_video_info(input_path)
+    duration = float(info["format"]["duration"])
+    width = int(info["streams"][0].get("width", 1080))
+    height = int(info["streams"][0].get("height", 1920))
 
-    # Generate ASS subtitle file from segments
+    # Try Remotion first (high-quality with complex animations)
+    use_remotion = req.renderer in ("remotion", "auto") and req.quality == "high"
+
+    if use_remotion:
+        from services.remotion_render import is_remotion_available, render_with_remotion
+
+        remotion_up = is_remotion_available()
+
+        if remotion_up:
+            try:
+                # Convert segments to dicts for JSON serialization
+                segments_data = [
+                    {
+                        "id": seg.id,
+                        "words": [{"text": w.text, "start": w.start, "end": w.end, "confidence": w.confidence} for w in seg.words],
+                        "text": seg.text,
+                        "start": seg.start,
+                        "end": seg.end,
+                    }
+                    for seg in req.segments
+                ]
+
+                result = render_with_remotion(
+                    project_id=project_id,
+                    video_path=input_path,
+                    segments=segments_data,
+                    caption_style=req.caption_style,
+                    duration_seconds=duration,
+                    width=width,
+                    height=height,
+                )
+
+                return RenderResponse(
+                    project_id=project_id,
+                    status="complete",
+                    download_url=f"/api/v1/download/{project_id}",
+                    duration=duration,
+                    renderer="remotion",
+                )
+            except Exception as e:
+                if req.renderer == "remotion":
+                    raise HTTPException(status_code=500, detail=f"Remotion render failed: {str(e)[:500]}")
+                logger.warning(f"Remotion render failed, falling back to FFmpeg: {e}")
+        elif req.renderer == "remotion":
+            raise HTTPException(status_code=503, detail="Remotion render server is not running. Start it with: cd frontend && npm run render-server")
+
+    # FFmpeg-ASS fallback (fast rendering)
+    output_path = str(PROCESSED_DIR / f"{project_id}_captioned.mp4")
     ass_path = str(PROCESSED_DIR / f"{project_id}.ass")
     ass_content = _generate_ass(req.segments, req.caption_style)
     with open(ass_path, "w", encoding="utf-8") as f:
         f.write(ass_content)
 
-    # Burn subtitles into video
-    # Escape path for FFmpeg subtitle filter (handles spaces, colons, backslashes)
     escaped_ass = ass_path.replace("\\", "\\\\\\\\").replace(":", "\\\\:").replace("'", "\\\\'")
     cmd = [
         "ffmpeg", "-y", "-i", input_path,
@@ -375,20 +455,26 @@ async def render_video(project_id: str, req: RenderRequest):
     if result.returncode != 0:
         raise HTTPException(status_code=500, detail=f"Render failed: {result.stderr[:500]}")
 
-    info = get_video_info(output_path)
-
     return RenderResponse(
         project_id=project_id,
         status="complete",
         download_url=f"/api/v1/download/{project_id}",
-        duration=float(info["format"]["duration"]),
+        duration=duration,
+        renderer="ffmpeg",
     )
 
 
 @app.get("/api/v1/download/{project_id}")
 async def download_rendered(project_id: str):
-    """Download the rendered video with burned-in captions."""
-    output_path = PROCESSED_DIR / f"{project_id}_captioned.mp4"
+    """Download the rendered video with burned-in captions.
+
+    Checks for Remotion output first, then FFmpeg output.
+    """
+    # Prefer Remotion output (higher quality)
+    remotion_path = PROCESSED_DIR / f"{project_id}_remotion.mp4"
+    ffmpeg_path = PROCESSED_DIR / f"{project_id}_captioned.mp4"
+
+    output_path = remotion_path if remotion_path.exists() else ffmpeg_path
     if not output_path.exists():
         raise HTTPException(status_code=404, detail="Rendered video not found")
 
@@ -520,6 +606,53 @@ class ReframeResponse(BaseModel):
     height: int
 
 
+class DynamicReframeResponse(BaseModel):
+    project_id: str
+    output_path: str
+    width: int
+    height: int
+    frames_processed: int
+    faces_detected: int
+    duration: float
+
+
+@app.post("/api/v1/reframe-dynamic/{project_id}", response_model=DynamicReframeResponse)
+async def reframe_video_dynamic(project_id: str, req: ReframeRequest):
+    """Dynamic face-tracking reframe: follows the speaker frame-by-frame.
+
+    Unlike static reframe, this detects the face in every frame and smoothly
+    pans the crop window to follow the speaker as they move.
+    """
+    from services.reframe import reframe_video_dynamic as do_reframe_dynamic
+
+    matches = list(UPLOAD_DIR.glob(f"{project_id}.*"))
+    if not matches:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    output_path = str(PROCESSED_DIR / f"{project_id}_portrait_dynamic.mp4")
+    result = do_reframe_dynamic(str(matches[0]), output_path, req.target_width, req.target_height)
+
+    return DynamicReframeResponse(
+        project_id=project_id,
+        output_path=result["output_path"],
+        width=req.target_width,
+        height=req.target_height,
+        frames_processed=result["frames_processed"],
+        faces_detected=result["faces_detected"],
+        duration=result["duration"],
+    )
+
+
+@app.get("/api/v1/download-reframed/{project_id}")
+async def download_reframed(project_id: str):
+    """Download the dynamically reframed video."""
+    output_path = PROCESSED_DIR / f"{project_id}_portrait_dynamic.mp4"
+    if not output_path.exists():
+        raise HTTPException(status_code=404, detail="Reframed video not found")
+    return FileResponse(path=str(output_path), media_type="video/mp4",
+        filename=f"bharat-shorts-{project_id[:8]}-reframed.mp4")
+
+
 @app.post("/api/v1/reframe/{project_id}", response_model=ReframeResponse)
 async def reframe_video(project_id: str, req: ReframeRequest):
     """Convert landscape video to portrait (9:16) with center crop."""
@@ -571,6 +704,981 @@ async def broll_suggestions(project_id: str, model_size: str = "base"):
         project_id=project_id,
         suggestions=[BRollMatch(**s) for s in suggestions],
     )
+
+
+# --- AI Stock Integration (India-Specific) ---
+
+@app.get("/api/v1/stock/search")
+async def search_stock_footage(
+    query: str,
+    media_type: str = "video",
+    per_page: int = 8,
+    orientation: str = "portrait",
+    india_focus: bool = True,
+):
+    """Search stock footage from Pexels + Pixabay with India-focus.
+
+    Automatically enhances generic queries with Indian context
+    (e.g. "food" → "Indian street food thali").
+    """
+    from services.stock import search_stock
+    return search_stock(query, media_type, per_page, orientation, india_focus)
+
+
+@app.get("/api/v1/stock/categories")
+async def list_stock_categories():
+    """List all curated Indian stock categories."""
+    from services.stock import list_categories
+    return {"categories": list_categories()}
+
+
+@app.get("/api/v1/stock/browse/{category_id}")
+async def browse_stock_category(
+    category_id: str,
+    media_type: str = "video",
+    per_page: int = 6,
+    orientation: str = "portrait",
+):
+    """Browse a curated Indian stock category (Mumbai, festivals, street food, etc.)."""
+    from services.stock import browse_category
+    result = browse_category(category_id, media_type, per_page, orientation)
+    if "error" in result:
+        raise HTTPException(status_code=404, detail=result["error"])
+    return result
+
+
+@app.post("/api/v1/stock/match/{project_id}")
+async def match_indian_stock(
+    project_id: str,
+    model_size: str = "base",
+    per_keyword: int = 3,
+    orientation: str = "portrait",
+):
+    """Get India-enhanced B-Roll suggestions for each transcript segment.
+
+    Like /broll-suggestions but uses multi-provider search (Pexels + Pixabay)
+    with India-specific keyword enhancement.
+    """
+    from services.transcription import transcribe
+    from services.stock import match_segments_to_indian_stock
+
+    matches = list(UPLOAD_DIR.glob(f"{project_id}.*"))
+    if not matches:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    result = transcribe(str(matches[0]), model_size=model_size)
+    suggestions = match_segments_to_indian_stock(
+        result["segments"],
+        per_keyword=per_keyword,
+        orientation=orientation,
+    )
+
+    return {"project_id": project_id, "suggestions": suggestions}
+
+
+# --- Platform-Specific Generators ---
+
+class PlatformRequest(BaseModel):
+    topic: str
+    language: str = "en"
+    count: int = 10
+    key_points: list[str] | None = None
+
+
+class HashtagRequest(BaseModel):
+    topic: str
+    platform: str = "instagram"
+    count: int = 30
+
+
+@app.post("/api/v1/tools/youtube-titles")
+async def gen_youtube_titles(req: PlatformRequest):
+    """Generate SEO-optimized YouTube titles."""
+    from services.platform_tools import generate_youtube_titles
+    titles = generate_youtube_titles(req.topic, count=req.count, language=req.language)
+    return {"topic": req.topic, "titles": titles}
+
+
+@app.post("/api/v1/tools/youtube-description")
+async def gen_youtube_description(req: PlatformRequest):
+    """Generate a full YouTube description with timestamps, CTA, and tags."""
+    from services.platform_tools import generate_youtube_description
+    desc = generate_youtube_description(req.topic, key_points=req.key_points, language=req.language)
+    return desc
+
+
+@app.post("/api/v1/tools/hashtags")
+async def gen_hashtags(req: HashtagRequest):
+    """Generate platform-optimized hashtags (Instagram, TikTok, YouTube)."""
+    from services.platform_tools import generate_hashtags
+    result = generate_hashtags(req.topic, platform=req.platform, count=req.count)
+    return result
+
+
+@app.post("/api/v1/tools/instagram-caption")
+async def gen_instagram_caption(req: PlatformRequest):
+    """Generate an Instagram caption with emojis, CTA, and hashtags."""
+    from services.platform_tools import generate_instagram_caption
+    result = generate_instagram_caption(req.topic, key_points=req.key_points, language=req.language)
+    return result
+
+
+@app.post("/api/v1/tools/tiktok-caption")
+async def gen_tiktok_caption(req: PlatformRequest):
+    """Generate a short TikTok caption with hashtags."""
+    from services.platform_tools import generate_tiktok_caption
+    result = generate_tiktok_caption(req.topic, language=req.language)
+    return result
+
+
+@app.post("/api/v1/tools/linkedin-post")
+async def gen_linkedin_post(req: PlatformRequest):
+    """Generate a professional LinkedIn post."""
+    from services.platform_tools import generate_linkedin_post
+    result = generate_linkedin_post(req.topic, key_points=req.key_points)
+    return result
+
+
+# --- Content Ideation AI Tools ---
+
+class IdeaRequest(BaseModel):
+    topic: str
+    niche: str = "general"
+    count: int = 10
+    language: str = "en"
+
+
+class HookRequest(BaseModel):
+    topic: str
+    count: int = 10
+    styles: list[str] | None = None
+    language: str = "en"
+
+
+class ScriptRequest(BaseModel):
+    topic: str
+    duration_seconds: int = 60
+    tone: str = "energetic"
+    language: str = "en"
+    include_cta: bool = True
+
+
+@app.post("/api/v1/tools/ideas")
+async def generate_ideas(req: IdeaRequest):
+    """AI Video Idea Generator.
+
+    Generates viral-worthy video ideas tailored to Indian creators.
+    Supports English and Hinglish output.
+    Categories: listicle, story, tutorial, controversial, trending.
+    """
+    from services.ideation import generate_video_ideas
+    ideas = generate_video_ideas(
+        topic=req.topic, niche=req.niche,
+        count=req.count, language=req.language,
+    )
+    return {"topic": req.topic, "ideas": ideas}
+
+
+@app.post("/api/v1/tools/hooks")
+async def generate_hooks_endpoint(req: HookRequest):
+    """AI Video Hook Generator.
+
+    Creates attention-grabbing opening lines optimized for
+    viewer retention on YouTube Shorts and Instagram Reels.
+    Styles: question, statistic, story, controversial.
+    """
+    from services.ideation import generate_hooks
+    hooks = generate_hooks(
+        topic=req.topic, count=req.count,
+        styles=req.styles, language=req.language,
+    )
+    return {"topic": req.topic, "hooks": hooks}
+
+
+@app.post("/api/v1/tools/script")
+async def generate_script_endpoint(req: ScriptRequest):
+    """AI Video Script Generator.
+
+    Generates a complete video script with hook, body points, and CTA.
+    Tones: energetic, calm, professional, funny, dramatic.
+    """
+    from services.ideation import generate_script
+    script = generate_script(
+        topic=req.topic, duration_seconds=req.duration_seconds,
+        tone=req.tone, language=req.language, include_cta=req.include_cta,
+    )
+    return script
+
+
+# --- AI Actors Studio (Avatar Video Generation) ---
+
+class AvatarRequest(BaseModel):
+    script: str
+    language: str = "hi"
+    gender: str = "female"
+    avatar_preset: str = "professional_female"
+    background: str = "studio_dark"
+    speech_rate: str = "+0%"
+    width: int = 1080
+    height: int = 1920
+
+
+class AvatarResponse(BaseModel):
+    project_id: str
+    status: str
+    download_url: str
+    duration: float
+    language: str
+    avatar_used: str
+
+
+class AvatarPreset(BaseModel):
+    id: str
+    name: str
+    label: str
+
+
+@app.get("/api/v1/avatar-presets", response_model=list[AvatarPreset])
+def get_avatar_presets():
+    """List available AI avatar presets."""
+    from services.avatar import list_avatar_presets
+    return list_avatar_presets()
+
+
+@app.get("/api/v1/avatar-backgrounds")
+def get_avatar_backgrounds():
+    """List available background templates for avatar videos."""
+    from services.avatar import list_backgrounds
+    return list_backgrounds()
+
+
+@app.post("/api/v1/avatar-video", response_model=AvatarResponse)
+async def create_avatar_video(req: AvatarRequest):
+    """Generate an AI avatar video from a text script.
+
+    No filming needed. The AI:
+    1. Converts your script to natural speech (24+ languages, male/female)
+    2. Renders an animated avatar with lip-sync driven by audio energy
+    3. Overlays word-by-word captions with highlighted current word
+    4. Produces a ready-to-post vertical video (1080x1920)
+
+    Great for: product demos, educational content, announcements,
+    social media posts, and any content where filming is impractical.
+    """
+    from services.avatar import generate_avatar_video
+    import asyncio
+
+    project_id = str(uuid.uuid4())
+    output_path = str(PROCESSED_DIR / f"{project_id}_avatar.mp4")
+
+    result = await generate_avatar_video(
+        script=req.script,
+        output_path=output_path,
+        lang=req.language,
+        gender=req.gender,
+        avatar_preset=req.avatar_preset,
+        background=req.background,
+        width=req.width,
+        height=req.height,
+        speech_rate=req.speech_rate,
+    )
+
+    return AvatarResponse(
+        project_id=project_id,
+        status="complete",
+        download_url=f"/api/v1/download-avatar/{project_id}",
+        duration=result["duration"],
+        language=result["language"],
+        avatar_used=result["avatar_used"],
+    )
+
+
+@app.post("/api/v1/avatar-video-with-image", response_model=AvatarResponse)
+async def create_avatar_video_with_image(
+    script: str = "नमस्ते, मैं आपका AI अवतार हूँ।",
+    language: str = "hi",
+    gender: str = "female",
+    background: str = "studio_dark",
+    speech_rate: str = "+0%",
+    image: UploadFile = File(...),
+):
+    """Generate an avatar video using a user-uploaded face image.
+
+    Upload a face photo and provide a script — the AI will create
+    a talking-head video with lip-sync animation.
+    """
+    from services.avatar import generate_avatar_video
+
+    project_id = str(uuid.uuid4())
+
+    # Save uploaded image
+    img_ext = Path(image.filename or "face.jpg").suffix
+    img_path = str(PROCESSED_DIR / f"{project_id}_face{img_ext}")
+    with open(img_path, "wb") as f:
+        content = await image.read()
+        f.write(content)
+
+    output_path = str(PROCESSED_DIR / f"{project_id}_avatar.mp4")
+
+    result = await generate_avatar_video(
+        script=script,
+        output_path=output_path,
+        lang=language,
+        gender=gender,
+        avatar_image_path=img_path,
+        background=background,
+        speech_rate=speech_rate,
+    )
+
+    # Cleanup face image
+    Path(img_path).unlink(missing_ok=True)
+
+    return AvatarResponse(
+        project_id=project_id,
+        status="complete",
+        download_url=f"/api/v1/download-avatar/{project_id}",
+        duration=result["duration"],
+        language=result["language"],
+        avatar_used=result["avatar_used"],
+    )
+
+
+@app.get("/api/v1/download-avatar/{project_id}")
+async def download_avatar_video(project_id: str):
+    """Download the generated avatar video."""
+    output_path = PROCESSED_DIR / f"{project_id}_avatar.mp4"
+    if not output_path.exists():
+        raise HTTPException(status_code=404, detail="Avatar video not found")
+
+    return FileResponse(
+        path=str(output_path),
+        media_type="video/mp4",
+        filename=f"bharat-shorts-avatar-{project_id[:8]}.mp4",
+    )
+
+
+# --- AI Eye Contact Correction ---
+
+class EyeContactRequest(BaseModel):
+    correction_strength: float = 0.7
+    process_every_n: int = 1
+
+
+class EyeContactResponse(BaseModel):
+    project_id: str
+    status: str
+    download_url: str
+    frames_processed: int
+    faces_detected: int
+    duration: float
+
+
+@app.post("/api/v1/eye-contact/{project_id}", response_model=EyeContactResponse)
+async def correct_eye_contact(project_id: str, req: EyeContactRequest):
+    """AI Eye Contact Correction.
+
+    Uses MediaPipe Face Mesh (478 landmarks) to detect iris position,
+    then warps each iris toward the eye center so the subject appears
+    to look directly at the camera.
+
+    Args:
+        correction_strength: 0.0 (off) to 1.0 (full correction). Default 0.7.
+        process_every_n: Process every Nth frame for speed (1=all frames).
+    """
+    from services.eye_contact import correct_eye_contact_video
+
+    matches = list(UPLOAD_DIR.glob(f"{project_id}.*"))
+    if not matches:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    input_path = str(matches[0])
+    output_path = str(PROCESSED_DIR / f"{project_id}_eye_contact.mp4")
+
+    result = correct_eye_contact_video(
+        input_path=input_path,
+        output_path=output_path,
+        correction_strength=req.correction_strength,
+        process_every_n=req.process_every_n,
+    )
+
+    return EyeContactResponse(
+        project_id=project_id,
+        status="complete",
+        download_url=f"/api/v1/download-eye-contact/{project_id}",
+        frames_processed=result["frames_processed"],
+        faces_detected=result["faces_detected"],
+        duration=result["duration"],
+    )
+
+
+@app.get("/api/v1/download-eye-contact/{project_id}")
+async def download_eye_contact(project_id: str):
+    """Download the eye-contact corrected video."""
+    output_path = PROCESSED_DIR / f"{project_id}_eye_contact.mp4"
+    if not output_path.exists():
+        raise HTTPException(status_code=404, detail="Corrected video not found")
+
+    return FileResponse(
+        path=str(output_path),
+        media_type="video/mp4",
+        filename=f"bharat-shorts-{project_id[:8]}-eye-contact.mp4",
+    )
+
+
+# --- Automated Assembly ---
+
+class AssembleRequest(BaseModel):
+    music_url: str | None = None
+    music_preset: str | None = None  # "chill_lo_fi", "upbeat_energy", etc.
+    music_volume: float = 0.15
+    max_broll_clips: int = 5
+    broll_min_gap: float = 10.0
+    model_size: str = "base"
+    add_sfx: bool = True
+    sfx_type: str = "whoosh"
+    sfx_volume: float = 0.7
+
+
+class AssembleResponse(BaseModel):
+    project_id: str
+    status: str
+    download_url: str
+    broll_inserted: int
+    music_added: bool
+    sfx_count: int = 0
+    duration: float
+
+
+@app.post("/api/v1/assemble/{project_id}", response_model=AssembleResponse)
+async def auto_assemble_video(project_id: str, req: AssembleRequest):
+    """Automatically assemble a polished video with B-Roll and music.
+
+    Pipeline:
+    1. Transcribes the video (if not already done)
+    2. Extracts keywords and finds matching B-Roll from Pexels
+    3. Downloads and inserts B-Roll clips at relevant timestamps
+    4. Adds background music with speech-aware ducking
+    5. Returns the fully assembled video
+
+    Args:
+        music_url: Optional URL to a background music file.
+                   If not provided, assembles without music.
+        music_volume: Base volume of background music (0.0-1.0)
+        max_broll_clips: Max number of B-Roll clips to insert
+        broll_min_gap: Minimum seconds between B-Roll insertions
+    """
+    from services.transcription import transcribe
+    from services.broll import match_broll_to_segments
+    from services.assembly import auto_assemble, download_stock_clip
+    from services.sfx import add_sfx_to_video, generate_music_loop
+
+    matches = list(UPLOAD_DIR.glob(f"{project_id}.*"))
+    if not matches:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    video_path = str(matches[0])
+
+    # Step 1: Transcribe
+    transcript = transcribe(video_path, model_size=req.model_size)
+    segments = transcript["segments"]
+
+    # Step 2: Get B-Roll suggestions
+    broll_suggestions = match_broll_to_segments(segments)
+
+    # Step 3: Handle music (URL or preset)
+    music_path = None
+    if req.music_url:
+        music_path = str(PROCESSED_DIR / f"{project_id}_music.mp3")
+        if not download_stock_clip(req.music_url, music_path):
+            music_path = None
+    elif req.music_preset:
+        try:
+            music_path = generate_music_loop(req.music_preset)
+        except Exception as e:
+            logger.warning(f"Music preset generation failed: {e}")
+
+    # Step 4: Auto-assemble (B-Roll + music)
+    result = auto_assemble(
+        project_id=project_id,
+        video_path=video_path,
+        segments=segments,
+        broll_suggestions=broll_suggestions,
+        music_path=music_path,
+        music_volume=req.music_volume,
+        max_broll_clips=req.max_broll_clips,
+        broll_min_gap=req.broll_min_gap,
+    )
+
+    # Step 5: Add SFX transitions
+    sfx_count = 0
+    if req.add_sfx:
+        assembled_path = result["output_path"]
+        sfx_result = add_sfx_to_video(
+            project_id=project_id,
+            video_path=assembled_path,
+            segments=segments,
+            sfx_type=req.sfx_type,
+            sfx_volume=req.sfx_volume,
+        )
+        sfx_count = sfx_result["sfx_count"]
+        # If SFX were added, update the assembled output
+        if sfx_count > 0 and sfx_result["output_path"] != assembled_path:
+            import shutil
+            final = str(PROCESSED_DIR / f"{project_id}_assembled.mp4")
+            shutil.copy(sfx_result["output_path"], final)
+
+    return AssembleResponse(
+        project_id=project_id,
+        status="complete",
+        download_url=f"/api/v1/download-assembled/{project_id}",
+        broll_inserted=result["broll_inserted"],
+        music_added=result["music_added"],
+        sfx_count=sfx_count,
+        duration=result["duration"],
+    )
+
+
+@app.get("/api/v1/download-assembled/{project_id}")
+async def download_assembled(project_id: str):
+    """Download the auto-assembled video."""
+    output_path = PROCESSED_DIR / f"{project_id}_assembled.mp4"
+    if not output_path.exists():
+        raise HTTPException(status_code=404, detail="Assembled video not found")
+
+    return FileResponse(
+        path=str(output_path),
+        media_type="video/mp4",
+        filename=f"bharat-shorts-{project_id[:8]}-assembled.mp4",
+    )
+
+
+# --- Automated SFX & Music ---
+
+class SFXRequest(BaseModel):
+    sfx_type: str = "whoosh"
+    sfx_volume: float = 0.7
+    min_gap: float = 3.0
+    place_at: str = "transitions"  # "transitions", "all_segments", "long_pauses"
+    model_size: str = "base"
+
+
+class SFXResponse(BaseModel):
+    project_id: str
+    status: str
+    download_url: str
+    sfx_count: int
+    sfx_type: str
+    placements: list[dict]
+
+
+@app.get("/api/v1/sfx-catalog")
+async def get_sfx_catalog():
+    """List all available SFX types."""
+    from services.sfx import list_sfx_catalog
+    return {"sfx": list_sfx_catalog()}
+
+
+@app.get("/api/v1/music-presets")
+async def get_music_presets():
+    """List all available background music presets."""
+    from services.sfx import list_music_presets
+    return {"presets": list_music_presets()}
+
+
+@app.post("/api/v1/sfx/{project_id}", response_model=SFXResponse)
+async def add_sfx(project_id: str, req: SFXRequest):
+    """Auto-add SFX transitions to a video.
+
+    Analyzes transcript segments to find natural transition points,
+    then mixes in the selected SFX sound at each point.
+    """
+    from services.transcription import transcribe
+    from services.sfx import add_sfx_to_video
+
+    matches = list(UPLOAD_DIR.glob(f"{project_id}.*"))
+    if not matches:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    video_path = str(matches[0])
+    transcript = transcribe(video_path, model_size=req.model_size)
+    segments = transcript["segments"]
+
+    result = add_sfx_to_video(
+        project_id=project_id,
+        video_path=video_path,
+        segments=segments,
+        sfx_type=req.sfx_type,
+        sfx_volume=req.sfx_volume,
+        min_gap=req.min_gap,
+        place_at=req.place_at,
+    )
+
+    return SFXResponse(
+        project_id=project_id,
+        status="complete",
+        download_url=f"/api/v1/download-sfx/{project_id}",
+        sfx_count=result["sfx_count"],
+        sfx_type=result["sfx_type"],
+        placements=result["placements"],
+    )
+
+
+@app.get("/api/v1/download-sfx/{project_id}")
+async def download_sfx_video(project_id: str):
+    """Download the video with SFX added."""
+    output_path = PROCESSED_DIR / f"{project_id}_sfx.mp4"
+    if not output_path.exists():
+        raise HTTPException(status_code=404, detail="SFX video not found")
+
+    return FileResponse(
+        path=str(output_path),
+        media_type="video/mp4",
+        filename=f"bharat-shorts-{project_id[:8]}-sfx.mp4",
+    )
+
+
+@app.post("/api/v1/generate-music/{preset}")
+async def generate_music(preset: str):
+    """Generate an ambient music loop from a preset."""
+    from services.sfx import generate_music_loop, MUSIC_PRESETS
+
+    if preset not in MUSIC_PRESETS:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown preset: {preset}. Available: {list(MUSIC_PRESETS.keys())}",
+        )
+
+    music_path = generate_music_loop(preset)
+    return FileResponse(
+        path=music_path,
+        media_type="audio/wav",
+        filename=f"bharat-shorts-{preset}.wav",
+    )
+
+
+# --- URL Ingestion (YouTube, Podcast, Direct) ---
+
+class IngestRequest(BaseModel):
+    url: str
+    max_duration: int = 7200
+
+
+class IngestResponse(BaseModel):
+    project_id: str
+    title: str
+    file_path: str
+    duration: float
+    width: int
+    height: int
+    source_url: str
+    source_type: str
+
+
+@app.post("/api/v1/ingest", response_model=IngestResponse)
+async def ingest_from_url(req: IngestRequest):
+    """Download a video from YouTube, podcast, or direct URL.
+
+    Supports:
+    - YouTube videos, Shorts, and links
+    - Podcast episodes (audio auto-converted to video)
+    - Direct video/audio URLs (MP4, WebM, etc.)
+
+    Downloads up to 1080p, max 2GB, max 2 hours (configurable).
+    """
+    from services.ingest import download_from_url
+
+    result = download_from_url(req.url, max_duration=req.max_duration)
+
+    return IngestResponse(
+        project_id=result["project_id"],
+        title=result["title"],
+        file_path=result["file_path"],
+        duration=result["duration"],
+        width=result["width"],
+        height=result["height"],
+        source_url=result["source_url"],
+        source_type=result["source_type"],
+    )
+
+
+# --- Translation & Dubbing ---
+
+class TranslateRequest(BaseModel):
+    segments: list[TranscriptSegment]
+    target_lang: str
+    source_lang: str = "auto"
+
+
+class TranslateResponse(BaseModel):
+    project_id: str
+    translated_segments: list[TranscriptSegment]
+    source_lang: str
+    target_lang: str
+
+
+class DubRequest(BaseModel):
+    segments: list[TranscriptSegment]
+    target_lang: str
+    gender: str = "female"
+    rate: str = "+0%"
+    keep_original_audio: bool = False
+    original_volume: float = 0.1
+
+
+class DubResponse(BaseModel):
+    project_id: str
+    status: str
+    download_url: str
+    target_lang: str
+    duration: float
+
+
+class SupportedLanguage(BaseModel):
+    code: str
+    name: str
+
+
+@app.get("/api/v1/languages", response_model=list[SupportedLanguage])
+def list_languages():
+    """List all supported languages for translation and dubbing."""
+    from services.translator import get_supported_languages
+    return get_supported_languages()
+
+
+@app.post("/api/v1/translate/{project_id}", response_model=TranslateResponse)
+async def translate_transcript(project_id: str, req: TranslateRequest):
+    """Translate transcript segments to a target language.
+
+    Preserves all timing data so captions stay synced.
+    Supports 24+ languages including Hindi, Tamil, Marathi, Telugu, Bengali, etc.
+    """
+    from services.translator import translate_segments
+
+    segments_dicts = [
+        {
+            "id": s.id,
+            "words": [{"text": w.text, "start": w.start, "end": w.end, "confidence": w.confidence} for w in s.words],
+            "text": s.text,
+            "start": s.start,
+            "end": s.end,
+            "speaker": s.speaker,
+        }
+        for s in req.segments
+    ]
+
+    translated = translate_segments(
+        segments_dicts,
+        target_lang=req.target_lang,
+        source_lang=req.source_lang,
+    )
+
+    result_segments = [
+        TranscriptSegment(
+            id=seg["id"],
+            words=[TranscriptWord(**w) for w in seg["words"]],
+            text=seg["text"],
+            start=seg["start"],
+            end=seg["end"],
+            speaker=seg.get("speaker"),
+        )
+        for seg in translated
+    ]
+
+    return TranslateResponse(
+        project_id=project_id,
+        translated_segments=result_segments,
+        source_lang=req.source_lang,
+        target_lang=req.target_lang,
+    )
+
+
+@app.post("/api/v1/dub/{project_id}", response_model=DubResponse)
+async def dub_video(project_id: str, req: DubRequest):
+    """Generate AI-dubbed video in a target language.
+
+    Pipeline:
+    1. Takes translated segments (text + timing)
+    2. Generates TTS audio per segment using Edge TTS (natural Indian voices)
+    3. Places each audio clip at the correct timestamp
+    4. Merges dubbed audio with the original video
+
+    Supports male/female voices for Hindi, Tamil, Marathi, Telugu,
+    Bengali, Kannada, Malayalam, Gujarati, Punjabi, Urdu, English,
+    Arabic, Spanish, French, German, Portuguese, Japanese, Korean, Chinese, etc.
+    """
+    import asyncio
+    from services.translator import generate_dubbed_audio, replace_audio_in_video
+
+    matches = list(UPLOAD_DIR.glob(f"{project_id}.*"))
+    if not matches:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    video_path = str(matches[0])
+    dub_dir = PROCESSED_DIR / f"{project_id}_dub"
+    dub_dir.mkdir(exist_ok=True)
+
+    segments_dicts = [
+        {
+            "id": s.id,
+            "text": s.text,
+            "start": s.start,
+            "end": s.end,
+        }
+        for s in req.segments
+    ]
+
+    # Generate dubbed audio track
+    dubbed_audio_path = await generate_dubbed_audio(
+        segments_dicts,
+        output_dir=str(dub_dir),
+        lang=req.target_lang,
+        gender=req.gender,
+        rate=req.rate,
+    )
+
+    # Merge into video
+    output_path = str(PROCESSED_DIR / f"{project_id}_dubbed_{req.target_lang}.mp4")
+    replace_audio_in_video(
+        video_path=video_path,
+        audio_path=dubbed_audio_path,
+        output_path=output_path,
+        keep_original_audio=req.keep_original_audio,
+        original_volume=req.original_volume,
+    )
+
+    # Cleanup temp dub directory
+    import shutil
+    shutil.rmtree(str(dub_dir), ignore_errors=True)
+
+    info = get_video_info(output_path)
+
+    return DubResponse(
+        project_id=project_id,
+        status="complete",
+        download_url=f"/api/v1/download-dubbed/{project_id}/{req.target_lang}",
+        target_lang=req.target_lang,
+        duration=float(info["format"]["duration"]),
+    )
+
+
+@app.get("/api/v1/download-dubbed/{project_id}/{lang}")
+async def download_dubbed(project_id: str, lang: str):
+    """Download the dubbed video."""
+    output_path = PROCESSED_DIR / f"{project_id}_dubbed_{lang}.mp4"
+    if not output_path.exists():
+        raise HTTPException(status_code=404, detail="Dubbed video not found")
+
+    return FileResponse(
+        path=str(output_path),
+        media_type="video/mp4",
+        filename=f"bharat-shorts-{project_id[:8]}-{lang}.mp4",
+    )
+
+
+# --- Async Task Queue (Celery/Redis) ---
+
+@app.get("/api/v1/task/{task_id}")
+async def get_task_status(task_id: str):
+    """Poll task progress. Returns state, step, progress percentage.
+
+    States: PENDING → STARTED → PROGRESS → SUCCESS / FAILURE
+    """
+    try:
+        from workers.celery_app import celery_app as celery
+        result = celery.AsyncResult(task_id)
+
+        response = {
+            "task_id": task_id,
+            "state": result.state,
+            "ready": result.ready(),
+        }
+
+        if result.state == "PROGRESS":
+            response["meta"] = result.info
+        elif result.state == "SUCCESS":
+            response["result"] = result.result
+        elif result.state == "FAILURE":
+            response["error"] = str(result.result)
+
+        return response
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Task queue unavailable: {e}")
+
+
+class AsyncDispatchRequest(BaseModel):
+    """Generic async task dispatch."""
+    task_name: str  # e.g. "transcribe_video", "render_video", "assemble_video"
+    kwargs: dict = {}
+
+
+class AsyncDispatchResponse(BaseModel):
+    task_id: str
+    task_name: str
+    status: str
+
+
+@app.post("/api/v1/async/dispatch", response_model=AsyncDispatchResponse)
+async def dispatch_async_task(req: AsyncDispatchRequest):
+    """Dispatch any heavy operation as an async Celery task.
+
+    Available task names:
+    - transcribe_video: {project_id, model_size, language}
+    - render_video: {project_id, segments, caption_style, renderer, quality}
+    - render_video_4k: {project_id, segments, caption_style, width, height}
+    - assemble_video: {project_id, music_preset, add_sfx, sfx_type}
+    - eye_contact_fix: {project_id, strength}
+    - dynamic_reframe: {project_id, target_width, target_height}
+    - generate_avatar: {project_id, text, voice, preset, background}
+    - generate_dub: {project_id, target_language, voice_gender}
+    - add_sfx: {project_id, sfx_type, sfx_volume, place_at}
+    - process_video_full: {project_id, options}
+    """
+    try:
+        from workers.celery_app import celery_app as celery
+        task = celery.send_task(req.task_name, kwargs=req.kwargs)
+        return AsyncDispatchResponse(
+            task_id=task.id,
+            task_name=req.task_name,
+            status="queued",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Failed to dispatch task: {e}")
+
+
+@app.get("/api/v1/queue/stats")
+async def queue_stats():
+    """Get Celery queue statistics (active, reserved, scheduled tasks)."""
+    try:
+        from workers.celery_app import celery_app as celery
+        inspector = celery.control.inspect()
+
+        active = inspector.active() or {}
+        reserved = inspector.reserved() or {}
+        scheduled = inspector.scheduled() or {}
+
+        total_active = sum(len(v) for v in active.values())
+        total_reserved = sum(len(v) for v in reserved.values())
+        total_scheduled = sum(len(v) for v in scheduled.values())
+
+        workers = list(active.keys()) or list(reserved.keys())
+
+        return {
+            "workers": len(workers),
+            "worker_names": workers,
+            "active_tasks": total_active,
+            "reserved_tasks": total_reserved,
+            "scheduled_tasks": total_scheduled,
+            "status": "connected" if workers else "no_workers",
+        }
+    except Exception as e:
+        return {
+            "workers": 0,
+            "worker_names": [],
+            "active_tasks": 0,
+            "reserved_tasks": 0,
+            "scheduled_tasks": 0,
+            "status": f"disconnected: {e}",
+        }
 
 
 # --- Enterprise Bulk API ---

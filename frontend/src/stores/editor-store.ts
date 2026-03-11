@@ -23,7 +23,7 @@ export interface CaptionStyle {
   primaryColor: string;
   highlightColor: string;
   position: "bottom" | "center" | "top";
-  animation: "pop" | "fade" | "typewriter" | "karaoke";
+  animation: "pop" | "fade" | "typewriter" | "karaoke" | "bounce" | "glow" | "shake" | "emoji-pop";
 }
 
 export interface VideoProject {
