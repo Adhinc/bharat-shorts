@@ -43,11 +43,9 @@ export const VideoPlayer: React.FC<Props> = ({
     const player = playerRef.current;
     if (!player) return;
 
-    const handleFrameUpdate = () => {
-      const frame = (player as unknown as { getCurrentFrame?: () => number }).getCurrentFrame?.();
-      if (typeof frame === "number") {
-        onTimeUpdate(frame / fps);
-      }
+    const handleFrameUpdate = (e: Record<string, unknown>) => {
+      const detail = e.detail as { frame: number } | undefined;
+      if (detail) onTimeUpdate(detail.frame / fps);
     };
 
     player.addEventListener("frameupdate", handleFrameUpdate);

@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 app = FastAPI(title="Bharat Shorts API", version="0.1.0")
 
@@ -34,7 +34,7 @@ _setup_ffmpeg_path()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -50,13 +50,14 @@ async def global_exception_handler(request: Request, exc: Exception):
     logger.error(traceback.format_exc())
     return JSONResponse(
         status_code=500,
-        content={"message": "Internal Server Error", "detail": str(exc), "traceback": traceback.format_exc()},
+        content={"message": "Internal Server Error", "detail": str(exc)},
     )
 
-UPLOAD_DIR = Path("uploads")
+_BASE_DIR = Path(__file__).resolve().parent.parent
+UPLOAD_DIR = _BASE_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-PROCESSED_DIR = Path("processed")
+PROCESSED_DIR = _BASE_DIR / "processed"
 PROCESSED_DIR.mkdir(exist_ok=True)
 
 
@@ -361,9 +362,11 @@ async def render_video(project_id: str, req: RenderRequest):
         f.write(ass_content)
 
     # Burn subtitles into video
+    # Escape path for FFmpeg subtitle filter (handles spaces, colons, backslashes)
+    escaped_ass = ass_path.replace("\\", "\\\\\\\\").replace(":", "\\\\:").replace("'", "\\\\'")
     cmd = [
         "ffmpeg", "-y", "-i", input_path,
-        "-vf", f"ass={ass_path}",
+        "-vf", f"ass='{escaped_ass}'",
         "-c:v", "libx264", "-preset", "fast",
         "-c:a", "aac",
         output_path,
@@ -437,12 +440,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
         # Build karaoke-style text with word-level highlighting
         if seg.words:
-            parts = []
-            for word in seg.words:
-                # Duration in centiseconds for karaoke effect
-                duration_cs = int((word.end - word.start) * 100)
-                parts.append(f"{{\\kf{duration_cs}}}{word.text}")
-            text = " ".join(parts) if not parts else "".join(
+            text = "".join(
                 f"{{\\kf{int((w.end - w.start) * 100)}}}{w.text} " for w in seg.words
             ).strip()
         else:
@@ -579,11 +577,11 @@ async def broll_suggestions(project_id: str, model_size: str = "base"):
 
 class BulkProcessRequest(BaseModel):
     project_ids: list[str]
-    options: dict = {
+    options: dict = Field(default_factory=lambda: {
         "remove_silence": True,
         "model_size": "base",
         "language": None,
-    }
+    })
 
 
 class BulkProcessResponse(BaseModel):

@@ -59,52 +59,59 @@ def _get_video_duration(input_path: str) -> float:
 
 def detect_face_position(input_path: str, sample_frames: int = 5) -> tuple[int, int]:
     """
-    Detect the primary face position in a video by averaging the first N frames.
+    Detect the primary face position in a video.
+
+    Uses MediaPipe if available, otherwise falls back to center crop.
 
     Returns:
         (x, y) pixel coordinates of the face center.
     """
-    import cv2
-    import mediapipe as mp
-    import numpy as np
+    src_w, src_h = _get_video_dimensions(input_path)
+
+    try:
+        import cv2
+        import mediapipe as mp
+        import numpy as np
+    except ImportError:
+        logger.warning("MediaPipe/OpenCV not installed, using center crop fallback")
+        return (src_w // 2, src_h // 2)
 
     mp_face_detection = mp.solutions.face_detection
-    
-    src_w, src_h = _get_video_dimensions(input_path)
     cap = cv2.VideoCapture(input_path)
-    
+
+    # Sample frames evenly across the video
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total_frames <= 0:
+        total_frames = sample_frames
+    step = max(1, total_frames // sample_frames)
+
     face_centers = []
-    
+
     with mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5) as face_detection:
-        for _ in range(sample_frames):
+        for i in range(sample_frames):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, i * step)
             success, image = cap.read()
             if not success:
                 break
-            
-            # Convert to RGB for MediaPipe
+
             image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             results = face_detection.process(image_rgb)
-            
+
             if results.detections:
-                # Get the first (primary) detection
                 detection = results.detections[0]
                 bbox = detection.location_data.relative_bounding_box
-                
-                # Convert relative coordinates to pixel coordinates
                 center_x = int((bbox.xmin + bbox.width / 2) * src_w)
                 center_y = int((bbox.ymin + bbox.height / 2) * src_h)
                 face_centers.append((center_x, center_y))
-    
+
     cap.release()
-    
+
     if face_centers:
-        # Return the median center to avoid outliers
         avg_x = int(np.median([c[0] for c in face_centers]))
         avg_y = int(np.median([c[1] for c in face_centers]))
         logger.info(f"Detected face at ({avg_x}, {avg_y})")
         return (avg_x, avg_y)
-    
-    # Fallback to center if no face detected
+
     logger.warning("No face detected, falling back to center crop")
     return (src_w // 2, src_h // 2)
 

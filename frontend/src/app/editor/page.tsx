@@ -4,7 +4,7 @@ import { useEditorStore } from "@/stores/editor-store";
 import { VideoPlayer } from "@/components/VideoPlayer";
 import { useCallback, useRef, useState } from "react";
 
-const API = "http://localhost:8000";
+const API = "";
 
 export default function EditorPage() {
   const {
@@ -172,7 +172,7 @@ export default function EditorPage() {
   const videoUrl = `${API}/api/v1/video/${project.id}`;
 
   return (
-    <main className="flex h-screen overflow-hidden">
+    <main className="flex h-[calc(100vh-3.5rem)] overflow-hidden">
       {/* Left Panel: Transcript Editor */}
       <div className="w-[320px] flex-shrink-0 border-r border-neutral-800 flex flex-col">
         <div className="p-4 border-b border-neutral-800">

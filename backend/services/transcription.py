@@ -5,17 +5,19 @@ from faster_whisper import WhisperModel
 
 # Singleton model instance
 _model: WhisperModel | None = None
+_model_size: str | None = None
 
 
 def get_model(model_size: str = "base") -> WhisperModel:
-    """Lazy-load Whisper model. Uses CPU by default, switch to 'cuda' for GPU."""
-    global _model
-    if _model is None:
+    """Lazy-load Whisper model. Reloads if model_size changes."""
+    global _model, _model_size
+    if _model is None or _model_size != model_size:
         _model = WhisperModel(
             model_size,
             device="cpu",
             compute_type="int8",
         )
+        _model_size = model_size
     return _model
 
 
@@ -45,7 +47,7 @@ def transcribe(video_path: str, model_size: str = "base", language: str | None =
         }
     """
     # Extract audio to temp WAV
-    audio_dir = Path("processed")
+    audio_dir = Path(__file__).resolve().parent.parent / "processed"
     audio_dir.mkdir(exist_ok=True)
     audio_path = str(audio_dir / f"{uuid.uuid4()}.wav")
 

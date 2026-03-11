@@ -48,7 +48,8 @@ def remove_silence(
             silence_ends.append(float(val))
 
     if not silence_starts:
-        subprocess.run(["cp", input_path, output_path])
+        import shutil
+        shutil.copy(input_path, output_path)
         info = get_video_info(output_path)
         return float(info["format"]["duration"])
 
@@ -67,7 +68,8 @@ def remove_silence(
         segments.append((prev_end, total_duration))
 
     if not segments:
-        subprocess.run(["cp", input_path, output_path])
+        import shutil
+        shutil.copy(input_path, output_path)
         return total_duration
 
     # Build FFmpeg filter for concatenating non-silent parts
